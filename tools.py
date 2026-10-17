@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 from typing import Any
 
+from dotenv import load_dotenv
 from falkordb import FalkorDB
 from langchain_core.tools import tool
 
 
-_GRAPH_NAME = "incident_investigator"
-_FALKORDB_HOST = "localhost"
-_FALKORDB_PORT = 6379
+load_dotenv()
+
 _MAX_HISTORICAL_INCIDENTS = 20
 _MAX_OWNER_AND_RUNBOOK_RESULTS = 50
 
@@ -19,15 +20,100 @@ _db: FalkorDB | None = None
 _graph: Any | None = None
 
 
+def _streamlit_secret(name: str) -> str | None:
+    """Read an optional Streamlit secret without requiring cloud configuration."""
+    try:
+        import streamlit as st
+
+        value = st.secrets.get(name)
+    except (FileNotFoundError, KeyError, RuntimeError):
+        return None
+
+    if value is None:
+        return None
+    value_text = str(value).strip()
+    return value_text or None
+
+
+def _setting(name: str, default: str | None = None) -> str | None:
+    """Read local environment configuration, then Streamlit secrets."""
+    value = os.getenv(name) or _streamlit_secret(name)
+    return value.strip() if value else default
+
+
+def _setting_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean connection setting."""
+    value = _setting(name)
+    if value is None:
+        return default
+    return value.casefold() in {"1", "true", "yes", "on"}
+
+
+def _connection_kwargs() -> dict[str, Any]:
+    """Build only supported FalkorDB connection options from configuration."""
+    kwargs: dict[str, Any] = {
+        "host": _setting("FALKORDB_HOST", "localhost"),
+        "port": int(_setting("FALKORDB_PORT", "6379") or "6379"),
+        "ssl": _setting_bool("FALKORDB_SSL"),
+    }
+
+    optional_settings = {
+        "username": "FALKORDB_USERNAME",
+        "password": "FALKORDB_PASSWORD",
+        "ssl_cert_reqs": "FALKORDB_SSL_CERT_REQS",
+        "ssl_ca_certs": "FALKORDB_SSL_CA_CERTS",
+        "ssl_ca_path": "FALKORDB_SSL_CA_PATH",
+        "ssl_ca_data": "FALKORDB_SSL_CA_DATA",
+        "ssl_certfile": "FALKORDB_SSL_CERTFILE",
+        "ssl_keyfile": "FALKORDB_SSL_KEYFILE",
+        "ssl_password": "FALKORDB_SSL_PASSWORD",
+        "ssl_ocsp_expected_cert": "FALKORDB_SSL_OCSP_EXPECTED_CERT",
+    }
+    for option, setting_name in optional_settings.items():
+        value = _setting(setting_name)
+        if value is not None:
+            kwargs[option] = value
+
+    if _setting("FALKORDB_SSL_CHECK_HOSTNAME") is not None:
+        kwargs["ssl_check_hostname"] = _setting_bool(
+            "FALKORDB_SSL_CHECK_HOSTNAME"
+        )
+    for option, setting_name in {
+        "ssl_validate_ocsp": "FALKORDB_SSL_VALIDATE_OCSP",
+        "ssl_validate_ocsp_stapled": "FALKORDB_SSL_VALIDATE_OCSP_STAPLED",
+    }.items():
+        if _setting(setting_name) is not None:
+            kwargs[option] = _setting_bool(setting_name)
+
+    return kwargs
+
+
 def _get_graph() -> Any:
     """Return the lazily initialized shared FalkorDB graph."""
     global _db, _graph
 
     if _graph is None:
-        _db = FalkorDB(host=_FALKORDB_HOST, port=_FALKORDB_PORT)
-        _graph = _db.select_graph(_GRAPH_NAME)
+        url = _setting("FALKORDB_URL")
+        if url:
+            url_kwargs = _connection_kwargs()
+            url_kwargs.pop("host", None)
+            url_kwargs.pop("port", None)
+            url_kwargs.pop("ssl", None)
+            _db = FalkorDB.from_url(url, **url_kwargs)
+        else:
+            _db = FalkorDB(**_connection_kwargs())
+        graph_name = _setting("FALKORDB_GRAPH_NAME", "incident_investigator")
+        _graph = _db.select_graph(graph_name)
 
     return _graph
+
+
+def _safe_database_error(exc: Exception) -> str:
+    """Describe a database failure without exposing connection details."""
+    return (
+        f"{type(exc).__name__}; check the FalkorDB endpoint, credentials, "
+        "TLS settings, and availability."
+    )
 
 
 def _node_label(node: Any) -> str:
@@ -188,7 +274,7 @@ def get_impacted_services(service_name: str) -> str:
     except Exception as exc:
         return (
             f"Unable to find impacted services for '{service_name}': "
-            f"{type(exc).__name__}: {exc}"
+            f"{_safe_database_error(exc)}"
         )
 
 
@@ -265,7 +351,7 @@ def get_recent_deployments(service_name: str) -> str:
     except Exception as exc:
         return (
             f"Unable to find recent deployments for '{service_name}': "
-            f"{type(exc).__name__}: {exc}"
+            f"{_safe_database_error(exc)}"
         )
 
 
@@ -316,7 +402,7 @@ def get_historical_incidents(service_name: str) -> str:
     except Exception as exc:
         return (
             f"Unable to find historical incidents for '{service_name}': "
-            f"{type(exc).__name__}: {exc}"
+            f"{_safe_database_error(exc)}"
         )
 
 
@@ -370,7 +456,7 @@ def get_service_dependencies(service_name: str) -> str:
     except Exception as exc:
         return (
             f"Unable to find direct dependencies for '{service_name}': "
-            f"{type(exc).__name__}: {exc}"
+            f"{_safe_database_error(exc)}"
         )
 
 
@@ -495,7 +581,7 @@ def get_service_blast_radius(service_name: str) -> str:
     except Exception as exc:
         return (
             f"Unable to measure the service blast radius for "
-            f"'{service_name}': {type(exc).__name__}: {exc}"
+            f"'{service_name}': {_safe_database_error(exc)}"
         )
 
 
@@ -564,7 +650,7 @@ def get_service_owner_and_runbook(service_name: str) -> str:
     except Exception as exc:
         return (
             f"Unable to find owners or runbooks for '{service_name}': "
-            f"{type(exc).__name__}: {exc}"
+            f"{_safe_database_error(exc)}"
         )
 
 

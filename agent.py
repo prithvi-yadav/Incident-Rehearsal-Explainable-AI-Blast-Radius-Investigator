@@ -131,11 +131,17 @@ def _create_agent() -> Any:
     """Create the incident investigation agent after loading API configuration."""
     load_dotenv()
 
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    api_key = (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or _streamlit_secret("GEMINI_API_KEY")
+        or _streamlit_secret("GOOGLE_API_KEY")
+    )
     if not api_key:
         raise RuntimeError(
             "Gemini API key is not configured. Set GEMINI_API_KEY or "
-            "GOOGLE_API_KEY in the environment or .env file."
+            "GOOGLE_API_KEY in the environment, .env file, or Streamlit "
+            "Community Cloud secrets."
         )
 
     model = ChatGoogleGenerativeAI(
@@ -148,6 +154,21 @@ def _create_agent() -> Any:
         tools=incident_tools,
         system_prompt=_SYSTEM_PROMPT,
     )
+
+
+def _streamlit_secret(name: str) -> str | None:
+    """Read an optional Streamlit secret without requiring cloud configuration."""
+    try:
+        import streamlit as st
+
+        value = st.secrets.get(name)
+    except (FileNotFoundError, KeyError, RuntimeError):
+        return None
+
+    if value is None:
+        return None
+    value_text = str(value).strip()
+    return value_text or None
 
 
 def _final_response(agent_result: dict[str, Any]) -> str:

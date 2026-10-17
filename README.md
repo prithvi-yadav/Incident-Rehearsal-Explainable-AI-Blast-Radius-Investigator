@@ -1,6 +1,6 @@
 # Incident Rehearsal
 
-> **AI-powered blast-radius investigation for software incidents, grounded in a live FalkorDB service graph.**
+> **AI-powered blast-radius investigation for software incidents, backed by a FalkorDB graph containing synthetic demonstration data.**
 
 Incident Rehearsal helps engineers investigate a reported software incident by tracing service dependencies, measuring potential blast radius, retrieving operational evidence, and rehearsing hypothetical dependency isolation without changing the stored graph.
 
@@ -150,9 +150,9 @@ The graph visualization and rehearsal calculations use graph data loaded by the 
 | LangChain | Tool definitions and agent orchestration |
 | Google Gemini | Preferred LLM investigation path through `langchain-google-genai` |
 | Graphviz | 2D dependency graph rendering through Streamlit's `st.graphviz_chart()` |
-| `python-dotenv` | Loads `GEMINI_API_KEY` or `GOOGLE_API_KEY` from local environment configuration |
+| `python-dotenv` | Loads local Gemini and FalkorDB configuration from `.env` |
 
-The dependency manifest uses minimum-version constraints. The current local virtual environment was inspected on October 17, 2026 and reported:
+`requirements.txt` uses exact `==` version pins. The current local virtual environment was inspected on October 17, 2026 and reported:
 
 | Package | Installed version |
 |---|---:|
@@ -323,16 +323,18 @@ The comparison reports:
 
 ## Installation and local setup
 
-The commands below are written for Windows PowerShell. The repository URL is intentionally left as a placeholder because no GitHub URL is configured in this workspace.
+The commands below are written for Windows PowerShell.
 
 ### 1. Clone the repository
 
 ```powershell
-git clone <repository-url> graph-hacks
-Set-Location .\graph-hacks
+git clone https://github.com/prithvi-yadav/Incident-Rehearsal-Explainable-AI-Blast-Radius-Investigator.git Incident-Rehearsal-Explainable-AI-Blast-Radius-Investigator
+Set-Location .\Incident-Rehearsal-Explainable-AI-Blast-Radius-Investigator
 ```
 
-Replace `<repository-url>` with the GitHub repository URL after publishing the project. **Not run in this workspace.**
+The clone command and destination use the published repository:
+`https://github.com/prithvi-yadav/Incident-Rehearsal-Explainable-AI-Blast-Radius-Investigator`.
+The clone command was not run in this workspace.
 
 ### 2. Create and activate a virtual environment
 
@@ -350,11 +352,37 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The manifest uses minimum versions. The versions listed in the technology table are the versions currently installed in the existing `venv`, not a lockfile.
+The manifest uses exact pins. The versions listed in the technology table are
+the versions currently installed in the existing `venv`, matching the
+published `requirements.txt`.
 
-### 4. Start FalkorDB locally with Docker
+### 4. Configure FalkorDB
 
-The Python code connects to `localhost:6379` and selects the graph `incident_investigator`. A typical local FalkorDB container command is:
+For local development, the application defaults to `localhost:6379` and the
+`incident_investigator` graph. Copy `.env.example` to `.env` if you want to
+override those defaults or configure authentication/TLS:
+
+| Variable | Purpose |
+|---|---|
+| `FALKORDB_URL` | Optional `falkor://` or `falkors://` endpoint; preferred for hosted instances |
+| `FALKORDB_HOST` / `FALKORDB_PORT` | Host and port fallback when `FALKORDB_URL` is not set |
+| `FALKORDB_GRAPH_NAME` | Graph name; defaults to `incident_investigator` |
+| `FALKORDB_USERNAME` / `FALKORDB_PASSWORD` | Optional authentication for explicit host/port configuration |
+| `FALKORDB_SSL` | Enable TLS for explicit host/port configuration |
+| `FALKORDB_SSL_CERT_REQS` | TLS certificate requirement, such as `required` |
+| `FALKORDB_SSL_CA_CERTS` / `FALKORDB_SSL_CA_PATH` / `FALKORDB_SSL_CA_DATA` | Optional CA configuration |
+| `FALKORDB_SSL_CERTFILE` / `FALKORDB_SSL_KEYFILE` | Optional client certificate and key |
+| `FALKORDB_SSL_PASSWORD` | Optional client-key password |
+| `FALKORDB_SSL_CHECK_HOSTNAME` | Enable TLS hostname checking |
+| `FALKORDB_SSL_VALIDATE_OCSP` / `FALKORDB_SSL_VALIDATE_OCSP_STAPLED` | Optional OCSP validation |
+| `FALKORDB_SSL_OCSP_EXPECTED_CERT` | Optional expected OCSP certificate |
+
+The installed FalkorDB client supports these connection and TLS options. Do
+not commit credentials or URLs containing credentials.
+
+### 5. Start FalkorDB locally with Docker
+
+A typical local FalkorDB container command is:
 
 ```powershell
 docker run --name falkordb `
@@ -371,7 +399,7 @@ docker start falkordb
 
 The Docker commands were not executed during this documentation update. Confirm the image tag and local Docker installation before use.
 
-### 5. Configure Gemini locally
+### 6. Configure Gemini locally
 
 Create a `.env` file in the project root from the tracked template. Do not
 commit the local `.env`:
@@ -380,9 +408,11 @@ commit the local `.env`:
 Copy-Item .env.example .env
 ```
 
-`agent.py` loads `GEMINI_API_KEY` first and falls back to `GOOGLE_API_KEY`. The `.gitignore` excludes `.env`. Never paste a real key into source code or public documentation.
+`agent.py` loads `GEMINI_API_KEY` first and falls back to `GOOGLE_API_KEY`
+from the environment or `.env`. Never paste a real key into source code or
+public documentation.
 
-### 6. Seed the synthetic graph
+### 7. Seed the synthetic graph
 
 ```powershell
 python .\seed_graph.py
@@ -390,7 +420,7 @@ python .\seed_graph.py
 
 This writes the synthetic service and evidence records to FalkorDB using `MERGE`. It was not run as part of the README update.
 
-### 7. Run deterministic graph verification
+### 8. Run deterministic graph verification
 
 The relationship-effect verification temporarily removes only `Checkout → AuthService`, checks the changed tool output, restores the relationship with `MERGE`, and verifies the restored paths:
 
@@ -400,13 +430,35 @@ python .\verify_graph_effect.py
 
 This script changes the local graph temporarily and restores the edge in its cleanup path. Run it only against the intended local graph. It was not run as part of the README update.
 
-### 8. Start Streamlit
+### 9. Start Streamlit
 
 ```powershell
 python -m streamlit run app.py
 ```
 
 Open the local URL printed by Streamlit. Starting the Streamlit server and browser verification were not performed during the README update.
+
+### Streamlit Community Cloud configuration
+
+Deploy the repository with `app.py` as the main file. In the app's
+**Settings → Secrets** panel, add the following TOML configuration using your
+actual hosted FalkorDB values:
+
+```toml
+GEMINI_API_KEY = "your-gemini-api-key-here"
+FALKORDB_URL = "falkors://username:password@example.com:6379"
+FALKORDB_GRAPH_NAME = "incident_investigator"
+```
+
+The application reads Streamlit secrets when available and keeps local
+environment/`.env` configuration working for development. For a URL without
+embedded credentials, provide `FALKORDB_USERNAME` and `FALKORDB_PASSWORD` as
+separate secrets. TLS and certificate settings use the `FALKORDB_SSL_*`
+variables documented above. Do not publish real secret values.
+
+The remote FalkorDB endpoint must be reachable from Streamlit Community Cloud,
+allow its outbound connection, and contain the expected graph data. The app
+does not seed, update, delete, or otherwise modify the database at startup.
 
 ## Using the application
 
@@ -435,7 +487,11 @@ The deterministic rehearsal checks covered:
 - Isolating `CartService → AuthService`: 2 remaining unique dependents; only `CartService` no longer reachable.
 - Automatic scenario ranking, deterministic tie-breaking, and DOT edge removal.
 
-The exact interactive Streamlit browser experience, Docker startup, fresh dependency installation, and Gemini API execution have not been claimed as tested by this README.
+The Python syntax checks and deterministic rehearsal checks above were run in
+the existing virtual environment. The Streamlit browser experience was not
+manually exercised during this documentation review, so no browser behavior is
+claimed as tested here. A fresh dependency installation, Docker startup, and a
+new Gemini API request were also not performed and are not claimed as tested.
 
 ## Evidence and safety boundaries
 
