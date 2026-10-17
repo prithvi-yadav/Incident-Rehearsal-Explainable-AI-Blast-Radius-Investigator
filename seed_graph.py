@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 from typing import Any
 
+from dotenv import load_dotenv
 from falkordb import FalkorDB
 
 
-_GRAPH_NAME = "incident_investigator"
-_FALKORDB_HOST = "localhost"
-_FALKORDB_PORT = 6379
+load_dotenv()
+
+_DEFAULT_GRAPH_NAME = "incident_investigator"
+_DEFAULT_FALKORDB_HOST = "localhost"
+_DEFAULT_FALKORDB_PORT = 6379
 
 
 SERVICES = [
@@ -29,6 +33,64 @@ DEPENDENCIES = [
 ]
 
 
+def _setting(name: str, default: str | None = None) -> str | None:
+    """Read a non-secret local environment setting."""
+    value = os.getenv(name)
+    return value.strip() if value else default
+
+
+def _setting_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment setting."""
+    value = _setting(name)
+    if value is None:
+        return default
+    return value.casefold() in {"1", "true", "yes", "on"}
+
+
+def _connection_kwargs() -> dict[str, Any]:
+    """Build FalkorDB options using the same conventions as tools.py."""
+    port_value = _setting("FALKORDB_PORT", str(_DEFAULT_FALKORDB_PORT))
+    try:
+        port = int(port_value or _DEFAULT_FALKORDB_PORT)
+    except ValueError as exc:
+        raise ValueError("FALKORDB_PORT must be a valid integer.") from exc
+
+    kwargs: dict[str, Any] = {
+        "host": _setting("FALKORDB_HOST", _DEFAULT_FALKORDB_HOST),
+        "port": port,
+        "ssl": _setting_bool("FALKORDB_SSL"),
+    }
+    for option, setting_name in {
+        "username": "FALKORDB_USERNAME",
+        "password": "FALKORDB_PASSWORD",
+    }.items():
+        value = _setting(setting_name)
+        if value is not None:
+            kwargs[option] = value
+    return kwargs
+
+
+def _create_database() -> FalkorDB:
+    """Create a FalkorDB client from a URL or explicit connection settings."""
+    url = _setting("FALKORDB_URL")
+    if url:
+        url_kwargs = _connection_kwargs()
+        url_kwargs.pop("host", None)
+        url_kwargs.pop("port", None)
+        url_kwargs.pop("ssl", None)
+        return FalkorDB.from_url(url, **url_kwargs)
+
+    return FalkorDB(**_connection_kwargs())
+
+
+def _safe_connection_error(exc: Exception) -> str:
+    """Return connection guidance without exposing credentials or URLs."""
+    return (
+        f"{type(exc).__name__}; check FalkorDB availability, host, port, "
+        "credentials, TLS settings, and graph name."
+    )
+
+
 def _print_result_rows(result: Any) -> None:
     """Print rows from a FalkorDB result using the official result_set API."""
     for row in result.result_set:
@@ -40,8 +102,9 @@ def main() -> None:
     db: FalkorDB | None = None
 
     try:
-        db = FalkorDB(host=_FALKORDB_HOST, port=_FALKORDB_PORT)
-        graph = db.select_graph(_GRAPH_NAME)
+        db = _create_database()
+        graph_name = _setting("FALKORDB_GRAPH_NAME", _DEFAULT_GRAPH_NAME)
+        graph = db.select_graph(graph_name)
 
         service_query = """
         MERGE (service:Service {id: $id})
@@ -212,7 +275,7 @@ def main() -> None:
     except Exception as exc:
         print(
             "Unable to seed the incident investigator graph. "
-            f"{type(exc).__name__}: {exc}"
+            f"{_safe_connection_error(exc)}"
         )
         raise
     finally:
