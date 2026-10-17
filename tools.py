@@ -1,0 +1,578 @@
+"""LangChain tools for investigating incidents in the FalkorDB graph."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from falkordb import FalkorDB
+from langchain_core.tools import tool
+
+
+_GRAPH_NAME = "incident_investigator"
+_FALKORDB_HOST = "localhost"
+_FALKORDB_PORT = 6379
+_MAX_HISTORICAL_INCIDENTS = 20
+_MAX_OWNER_AND_RUNBOOK_RESULTS = 50
+
+_db: FalkorDB | None = None
+_graph: Any | None = None
+
+
+def _get_graph() -> Any:
+    """Return the lazily initialized shared FalkorDB graph."""
+    global _db, _graph
+
+    if _graph is None:
+        _db = FalkorDB(host=_FALKORDB_HOST, port=_FALKORDB_PORT)
+        _graph = _db.select_graph(_GRAPH_NAME)
+
+    return _graph
+
+
+def _node_label(node: Any) -> str:
+    """Return a display label from a FalkorDB node's properties."""
+    properties = getattr(node, "properties", {}) or {}
+
+    for property_name in ("name", "id", "title", "service_name"):
+        value = properties.get(property_name)
+        if value is not None:
+            return str(value)
+
+    return str(node)
+
+
+def _format_path(path: Any) -> str:
+    """Format a FalkorDB Path using its documented nodes() and edges() methods."""
+    nodes = list(path.nodes())
+    edges = list(path.edges())
+
+    if not nodes:
+        return str(path)
+
+    parts: list[str] = [_node_label(nodes[0])]
+
+    for index, edge in enumerate(edges):
+        if index + 1 >= len(nodes):
+            break
+
+        parts.append(f"-[:{edge.relation}]->")
+        parts.append(_node_label(nodes[index + 1]))
+
+    return " ".join(parts)
+
+
+def _row_value(row: Any, index: int) -> Any:
+    """Read a positional value from a FalkorDB result_set row."""
+    try:
+        return row[index]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _run_read_query(query: str, service_name: str) -> Any:
+    """Run a parameterized read-only query against the shared graph."""
+    service_name = service_name.strip()
+
+    return _get_graph().ro_query(
+        query,
+        params={"service_name": service_name},
+    )
+
+
+def get_service_graph_data() -> tuple[
+    list[dict[str, str]], list[tuple[str, str]]
+]:
+    """Return service names, statuses, and directed dependency edges."""
+    service_result = _get_graph().ro_query(
+        """
+        MATCH (service:Service)
+        RETURN service.id, service.name, service.status
+        ORDER BY service.name
+        """
+    )
+    edge_result = _get_graph().ro_query(
+        """
+        MATCH (dependent:Service)-[:DEPENDS_ON]->(dependency:Service)
+        RETURN dependent.name, dependency.name
+        ORDER BY dependent.name, dependency.name
+        """
+    )
+
+    services = [
+        {
+            "id": str(_row_value(row, 0) or ""),
+            "name": str(_row_value(row, 1) or ""),
+            "status": str(_row_value(row, 2) or ""),
+        }
+        for row in service_result.result_set
+    ]
+    dependencies = [
+        (
+            str(_row_value(row, 0) or ""),
+            str(_row_value(row, 1) or ""),
+        )
+        for row in edge_result.result_set
+    ]
+
+    return services, dependencies
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """
+    Parse a supported UTC timestamp.
+
+    Accepts Unix timestamps in seconds and ISO 8601 timestamps. ISO values
+    without an offset are treated as UTC. Invalid and out-of-range values
+    return None instead of raising.
+    """
+    if value is None:
+        return None
+
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+
+        timestamp = str(value).strip()
+        if not timestamp:
+            return None
+
+        try:
+            unix_timestamp = float(timestamp)
+        except ValueError:
+            unix_timestamp = None
+
+        if unix_timestamp is not None:
+            return datetime.fromtimestamp(unix_timestamp, tz=timezone.utc)
+
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+@tool
+def get_impacted_services(service_name: str) -> str:
+    """
+    Find services that directly or indirectly depend on a specified service.
+
+    Use this tool when investigating the blast radius of a service failure or
+    incident. It follows DEPENDS_ON relationships from dependent services to
+    the target service for one to five hops and returns every matching path
+    with its hop count.
+    """
+    query = """
+    MATCH p = (dependent:Service)-[:DEPENDS_ON*1..5]->(target:Service)
+    WHERE target.name = $service_name
+    RETURN p, length(p) AS hops
+    ORDER BY hops, dependent.name
+    """
+
+    try:
+        result = _run_read_query(query, service_name)
+        rows = result.result_set
+
+        if not rows:
+            return f"No impacted services were found for '{service_name}'."
+
+        lines = [f"Impacted services for '{service_name}':"]
+        for row in rows:
+            path = _row_value(row, 0)
+            hops = _row_value(row, 1)
+            lines.append(f"- {_format_path(path)} ({hops} hop(s))")
+
+        return "\n".join(lines)
+    except Exception as exc:
+        return (
+            f"Unable to find impacted services for '{service_name}': "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+@tool
+def get_recent_deployments(service_name: str) -> str:
+    """
+    Find deployments to a service from the last 24 hours.
+
+    Use this tool when checking whether a recent deployment may be related to
+    an incident. It reports version, commit hash, timestamp, description, and
+    the exact Deployment-to-Service graph path. Missing or invalid timestamps
+    are reported and are not classified as recent.
+    """
+    query = """
+    MATCH p = (deployment:Deployment)-[:DEPLOYED_TO]->(service:Service)
+    WHERE service.name = $service_name
+    RETURN p,
+           deployment.version,
+           deployment.commit_hash,
+           deployment.timestamp,
+           deployment.description
+    """
+
+    try:
+        result = _run_read_query(query, service_name)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        recent_deployments: list[str] = []
+        invalid_timestamp_count = 0
+
+        for row in result.result_set:
+            path = _row_value(row, 0)
+            version = _row_value(row, 1) or "unknown"
+            commit_hash = _row_value(row, 2) or "unknown"
+            timestamp_value = _row_value(row, 3)
+            description = _row_value(row, 4) or "No description"
+
+            timestamp = _parse_timestamp(timestamp_value)
+            if timestamp is None:
+                invalid_timestamp_count += 1
+                continue
+
+            if not cutoff <= timestamp <= now:
+                continue
+
+            recent_deployments.append(
+                f"- {_format_path(path)}\n"
+                f"  Version: {version}\n"
+                f"  Commit: {commit_hash}\n"
+                f"  Timestamp: {timestamp.isoformat()}\n"
+                f"  Description: {description}"
+            )
+
+        if recent_deployments:
+            lines = [
+                f"Recent deployments for '{service_name}':",
+                *recent_deployments,
+            ]
+            if invalid_timestamp_count:
+                lines.append(
+                    f"Skipped {invalid_timestamp_count} deployment(s) with "
+                    "missing or invalid timestamps."
+                )
+            return "\n".join(lines)
+
+        if invalid_timestamp_count:
+            return (
+                f"No recent deployments were found for '{service_name}'. "
+                f"{invalid_timestamp_count} deployment(s) had missing or "
+                "invalid timestamps and were skipped."
+            )
+
+        return f"No deployments from the last 24 hours were found for '{service_name}'."
+    except Exception as exc:
+        return (
+            f"Unable to find recent deployments for '{service_name}': "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+@tool
+def get_historical_incidents(service_name: str) -> str:
+    """
+    Find documented historical incidents that affected a service.
+
+    Use this tool to compare a current incident with previous incidents. It
+    follows PastIncident AFFECTED relationships, returns incident details,
+    documented root causes, resolutions, and exact graph paths. Results are
+    limited to a reasonable number.
+    """
+    query = f"""
+    MATCH p = (incident:PastIncident)-[:AFFECTED]->(service:Service)
+    WHERE service.name = $service_name
+    RETURN p,
+           incident.id,
+           incident.title,
+           incident.root_cause,
+           incident.resolution
+    LIMIT {_MAX_HISTORICAL_INCIDENTS}
+    """
+
+    try:
+        result = _run_read_query(query, service_name)
+
+        if not result.result_set:
+            return f"No historical incidents were found for '{service_name}'."
+
+        lines = [f"Historical incidents for '{service_name}':"]
+        for row in result.result_set:
+            path = _row_value(row, 0)
+            incident_id = _row_value(row, 1) or "unknown"
+            title = _row_value(row, 2) or "Untitled incident"
+            root_cause = _row_value(row, 3) or "Not documented"
+            resolution = _row_value(row, 4) or "Not documented"
+
+            lines.append(
+                f"- {_format_path(path)}\n"
+                f"  Incident ID: {incident_id}\n"
+                f"  Title: {title}\n"
+                f"  Root cause: {root_cause}\n"
+                f"  Resolution: {resolution}"
+            )
+
+        return "\n".join(lines)
+    except Exception as exc:
+        return (
+            f"Unable to find historical incidents for '{service_name}': "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+@tool
+def get_service_dependencies(service_name: str) -> str:
+    """
+    Find the direct dependencies of a service.
+
+    Use this tool to determine what the selected service depends on by
+    following outgoing DEPENDS_ON relationships. This is different from
+    get_impacted_services, which finds services that may be affected by a
+    failure in the selected service.
+    """
+    query = """
+    MATCH p = (service:Service)-[:DEPENDS_ON]->(dependency:Service)
+    WHERE service.name = $service_name
+    RETURN p,
+           service.name,
+           dependency.name,
+           dependency.status
+    """
+
+    try:
+        result = _run_read_query(query, service_name)
+
+        if not result.result_set:
+            return (
+                f"No direct dependencies were found by this query for "
+                f"'{service_name}'."
+            )
+
+        lines = [f"Direct dependencies of '{service_name}':"]
+        for row in result.result_set:
+            path = _row_value(row, 0)
+            requested_service = _row_value(row, 1) or service_name.strip()
+            dependency_name = _row_value(row, 2) or "Unknown"
+            dependency_status = _row_value(row, 3)
+            status_text = (
+                str(dependency_status)
+                if dependency_status is not None
+                else "Not recorded"
+            )
+
+            lines.append(
+                f"- {requested_service} depends on {dependency_name}\n"
+                f"  Path: {_format_path(path)}\n"
+                f"  Status: {status_text}"
+            )
+
+        return "\n".join(lines)
+    except Exception as exc:
+        return (
+            f"Unable to find direct dependencies for '{service_name}': "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+@tool
+def get_service_blast_radius(service_name: str) -> str:
+    """
+    Measure the structural blast radius of a service within three dependency hops.
+
+    Use this tool when assessing how many unique services may depend on the
+    selected service. It counts unique dependent Service nodes, assigns each
+    one its shortest dependency distance, and reports structural exposure only;
+    it does not establish current outages, business criticality, or causality.
+    """
+    query = """
+    MATCH (target:Service)
+    WHERE target.name = $service_name
+    OPTIONAL MATCH p = (dependent:Service)-[:DEPENDS_ON*1..3]->(target)
+    RETURN target.name,
+           dependent.id,
+           dependent.name,
+           p,
+           CASE WHEN p IS NULL THEN NULL ELSE length(p) END
+    ORDER BY dependent.name, length(p)
+    """
+
+    try:
+        result = _run_read_query(query, service_name)
+        rows = result.result_set
+
+        if not rows:
+            return (
+                f"Service '{service_name.strip()}' was not found. "
+                "No blast-radius measurements were made."
+            )
+
+        requested_name = _row_value(rows[0], 0) or service_name.strip()
+        dependents: dict[str, dict[str, Any]] = {}
+
+        for row in rows:
+            dependent_id = _row_value(row, 1)
+            dependent_name = _row_value(row, 2)
+            path = _row_value(row, 3)
+            hops = _row_value(row, 4)
+
+            if dependent_name is None or hops is None:
+                continue
+
+            try:
+                hop_count = int(hops)
+            except (TypeError, ValueError):
+                continue
+
+            if hop_count < 1 or hop_count > 3:
+                continue
+
+            key = str(dependent_id or dependent_name)
+            dependent = dependents.setdefault(
+                key,
+                {
+                    "name": str(dependent_name),
+                    "shortest_hops": hop_count,
+                    "paths": [],
+                },
+            )
+
+            if hop_count < dependent["shortest_hops"]:
+                dependent["shortest_hops"] = hop_count
+                dependent["paths"] = []
+
+            if hop_count == dependent["shortest_hops"] and path is not None:
+                formatted_path = _format_path(path)
+                if formatted_path not in dependent["paths"]:
+                    dependent["paths"].append(formatted_path)
+
+        if not dependents:
+            return (
+                f"Service '{requested_name}' was found, but no dependent "
+                "services were found within 3 hops by this query. This is a "
+                "structural graph measurement, not evidence about outages or "
+                "business criticality."
+            )
+
+        direct_count = sum(
+            dependent["shortest_hops"] == 1
+            for dependent in dependents.values()
+        )
+        indirect_count = sum(
+            dependent["shortest_hops"] > 1
+            for dependent in dependents.values()
+        )
+        maximum_distance = max(
+            dependent["shortest_hops"] for dependent in dependents.values()
+        )
+
+        lines = [
+            f"Structural blast radius for '{requested_name}' (up to 3 hops):",
+            "Service found: yes",
+            f"Unique dependent services: {len(dependents)}",
+            f"Direct dependents (shortest distance 1): {direct_count}",
+            f"Indirect dependents (shortest distance greater than 1): "
+            f"{indirect_count}",
+            f"Maximum shortest-path distance: {maximum_distance} hop(s)",
+            "Dependent services and shortest dependency paths:",
+        ]
+
+        for dependent in sorted(
+            dependents.values(),
+            key=lambda item: (item["shortest_hops"], item["name"]),
+        ):
+            lines.append(
+                f"- {dependent['name']} "
+                f"({dependent['shortest_hops']} hop(s))"
+            )
+            for path in dependent["paths"]:
+                lines.append(f"  Path: {path}")
+
+        lines.append(
+            "These counts describe structural graph exposure only; they do "
+            "not confirm outages, business criticality, or root cause."
+        )
+        return "\n".join(lines)
+    except Exception as exc:
+        return (
+            f"Unable to measure the service blast radius for "
+            f"'{service_name}': {type(exc).__name__}: {exc}"
+        )
+
+
+@tool
+def get_service_owner_and_runbook(service_name: str) -> str:
+    """
+    Find the maintainers and operational runbooks for a service.
+
+    Use this tool when an investigator needs to contact the service owner or
+    locate operational documentation. It separately follows MAINTAINED_BY and
+    DOCUMENTED_IN relationships, returning all matching owners and runbooks
+    with their exact graph paths.
+    """
+    owner_query = """
+    MATCH p = (service:Service)-[:MAINTAINED_BY]->(developer:Developer)
+    WHERE service.name = $service_name
+    RETURN p,
+           developer.name,
+           developer.email,
+           developer.on_call
+    """
+
+    runbook_query = """
+    MATCH p = (service:Service)-[:DOCUMENTED_IN]->(runbook:Runbook)
+    WHERE service.name = $service_name
+    RETURN p,
+           runbook.title,
+           runbook.url
+    """
+
+    try:
+        owner_result = _run_read_query(owner_query, service_name)
+        runbook_result = _run_read_query(runbook_query, service_name)
+
+        owners = [
+            (
+                f"- {_format_path(row[0])}\n"
+                f"  Developer: {row[1] or 'Unknown'}\n"
+                f"  Email: {row[2] or 'Unknown'}\n"
+                f"  On-call: {row[3] if row[3] is not None else 'Unknown'}"
+            )
+            for row in owner_result.result_set[:_MAX_OWNER_AND_RUNBOOK_RESULTS]
+        ]
+
+        runbooks = [
+            (
+                f"- {_format_path(row[0])}\n"
+                f"  Title: {row[1] or 'Untitled runbook'}\n"
+                f"  URL: {row[2] or 'No URL documented'}"
+            )
+            for row in runbook_result.result_set[:_MAX_OWNER_AND_RUNBOOK_RESULTS]
+        ]
+
+        if not owners and not runbooks:
+            return f"No owners or runbooks were found for '{service_name}'."
+
+        lines = [f"Owners and runbooks for '{service_name}':"]
+
+        lines.append("Owners:")
+        lines.extend(owners or ["- None found."])
+
+        lines.append("Runbooks:")
+        lines.extend(runbooks or ["- None found."])
+
+        return "\n".join(lines)
+    except Exception as exc:
+        return (
+            f"Unable to find owners or runbooks for '{service_name}': "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+incident_tools = [
+    get_impacted_services,
+    get_service_dependencies,
+    get_service_blast_radius,
+    get_recent_deployments,
+    get_historical_incidents,
+    get_service_owner_and_runbook,
+]
