@@ -115,6 +115,48 @@ The Streamlit page provides:
 - Status-colored service nodes and focused-service highlighting.
 - A complete Markdown report and a Markdown download button.
 
+### Murphy Fault Investigator
+
+The optional Murphy Fault Investigator reads bounded research evidence from a
+separate FalkorDB graph named `incident_rehearsal_research`. It does not seed
+or query the production `incident_investigator` graph, call Gemini, or run
+database writes when the Streamlit application starts.
+
+The standalone [`import_murphy_traces.py`](D:/graph-hacks/import_murphy_traces.py)
+parses the small run metadata and a bounded set of fault-overlapping Jaeger
+spans from a selected `compute-12.tar.gz` archive. Prometheus data is
+intentionally not imported in this first pilot because its identity joins have
+not been validated. Dry-run mode is the default:
+
+```powershell
+python .\import_murphy_traces.py `
+  --archive D:\MurphyResearch\pilot\compute-faults\compute-12.tar.gz `
+  --max-traces 5 `
+  --max-spans 100
+```
+
+The importer reports parsed counts without writing. A future reviewed import
+requires the explicit `--write` flag and still rejects
+`incident_investigator` as a target. Use only the isolated research graph:
+
+```powershell
+python .\import_murphy_traces.py `
+  --archive D:\MurphyResearch\pilot\compute-faults\compute-12.tar.gz `
+  --max-traces 5 `
+  --max-spans 100 `
+  --write
+```
+
+The Murphy mode displays exact fault targets and intervals, bounded trace/span
+evidence, parent-span identifiers, Jaeger service mappings, source files, and
+temporal overlap. Temporal overlap is not proof of causality, and benchmark
+container names are not silently converted into production services.
+
+The source is the CC0 Murphy traces dataset from the [University of Illinois
+Data Bank](https://databank.illinois.edu/datasets/IDB-6641912), using the
+DeathStarBench `hotel-reserv` benchmark. The data represents experimental
+benchmark measurements with injected failures, not live production telemetry.
+
 ## Architecture
 
 ```mermaid

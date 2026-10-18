@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from collections import Counter
+import math
 import os
 from typing import Any
 
@@ -106,6 +108,258 @@ def _get_graph() -> Any:
         _graph = _db.select_graph(graph_name)
 
     return _graph
+
+
+def _research_graph() -> Any:
+    """Select the research graph without changing the production graph name."""
+    global _db
+    if _db is None:
+        _get_graph()
+    return _db.select_graph("incident_rehearsal_research")
+
+
+def get_murphy_faults() -> list[dict[str, Any]]:
+    """Return recorded Murphy faults from the isolated research graph."""
+    result = _research_graph().ro_query(
+        """
+        MATCH (run:ResearchRun)-[:HAS_FAULT]->(fault:FaultInjection)
+        RETURN fault.id, fault.start_time, fault.end_time,
+               fault.target_entity, fault.fault_category, fault.phase,
+               run.id
+        ORDER BY fault.start_time, fault.id
+        """
+    )
+    return [
+        {
+            "id": _row_value(row, 0),
+            "start_time": _row_value(row, 1),
+            "end_time": _row_value(row, 2),
+            "target_entity": _row_value(row, 3),
+            "fault_category": _row_value(row, 4),
+            "phase": _row_value(row, 5),
+            "run_id": _row_value(row, 6),
+        }
+        for row in result.result_set
+    ]
+
+
+def get_murphy_fault_investigation(fault_id: str) -> dict[str, Any]:
+    """Return fault, trace, span, parent, and mapped-service evidence."""
+    graph = _research_graph()
+    fault_result = graph.ro_query(
+        """
+        MATCH (run:ResearchRun)-[:HAS_FAULT]->(fault:FaultInjection)
+        WHERE fault.id = $fault_id
+        OPTIONAL MATCH (fault)-[:TARGETS]->(target:ResearchComponent)
+        RETURN run.id, fault.id, fault.start_time, fault.end_time,
+               fault.target_entity, fault.fault_category, fault.phase,
+               target.id
+        """,
+        params={"fault_id": fault_id},
+    )
+    fault_rows = fault_result.result_set
+    if not fault_rows:
+        return {"fault": None, "spans": []}
+
+    row = fault_rows[0]
+    spans_result = graph.ro_query(
+        """
+        MATCH (run:ResearchRun)-[:HAS_FAULT]->(fault:FaultInjection)
+        MATCH (run)-[:HAS_TRACE]->(trace:ResearchTrace)
+              -[:HAS_SPAN]->(span:ResearchSpan)
+        WHERE fault.id = $fault_id
+        OPTIONAL MATCH (span)-[:MAPPED_TO_SERVICE]->(service:ResearchService)
+        OPTIONAL MATCH (parent:ResearchSpan)-[:PARENT_OF]->(span)
+        RETURN trace.id, span.id, span.original_span_id,
+               span.parent_span_id, parent.original_span_id,
+               span.process_id, span.service_name, service.name,
+               span.operation_name, span.start_time,
+               span.start_time_microseconds, span.duration_microseconds,
+               span.overlaps_fault, span.source_file
+        ORDER BY span.start_time, span.id
+        """,
+        params={"fault_id": fault_id},
+    )
+    return {
+        "fault": {
+            "run_id": _row_value(row, 0),
+            "id": _row_value(row, 1),
+            "start_time": _row_value(row, 2),
+            "end_time": _row_value(row, 3),
+            "target_entity": _row_value(row, 4),
+            "fault_category": _row_value(row, 5),
+            "phase": _row_value(row, 6),
+            "target_component": _row_value(row, 7),
+        },
+        "spans": [
+            {
+                "trace_id": _row_value(span, 0),
+                "span_id": _row_value(span, 1),
+                "original_span_id": _row_value(span, 2),
+                "parent_span_id": _row_value(span, 3),
+                "resolved_parent_span_id": _row_value(span, 4),
+                "process_id": _row_value(span, 5),
+                "service_name": _row_value(span, 6),
+                "mapped_service": _row_value(span, 7),
+                "operation_name": _row_value(span, 8),
+                "start_time": _row_value(span, 9),
+                "start_time_microseconds": _row_value(span, 10),
+                "duration_microseconds": _row_value(span, 11),
+                "stored_overlaps_fault": _row_value(span, 12),
+                "source_file": _row_value(span, 13),
+            }
+            for span in spans_result.result_set
+        ],
+    }
+
+
+def _span_interval_seconds(
+    span: dict[str, Any],
+) -> tuple[float, float] | None:
+    """Normalize a stored Jaeger span interval to Unix seconds."""
+    start_microseconds = span.get("start_time_microseconds")
+    duration_microseconds = span.get("duration_microseconds")
+    start_seconds = span.get("start_time")
+    if duration_microseconds is None:
+        return None
+    try:
+        duration = float(duration_microseconds) / 1_000_000
+        if start_microseconds is not None:
+            start = float(start_microseconds) / 1_000_000
+        elif start_seconds is not None:
+            start = float(start_seconds)
+        else:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(start) or not math.isfinite(duration) or duration < 0:
+        return None
+    return start, start + duration
+
+
+def _exact_fault_overlap(
+    span: dict[str, Any],
+    fault_start: Any,
+    fault_end: Any,
+) -> bool | str:
+    """Compare one span with the selected fault, returning unknown if unsafe."""
+    interval = _span_interval_seconds(span)
+    try:
+        start = float(fault_start)
+        end = float(fault_end)
+    except (TypeError, ValueError, OverflowError):
+        return "unknown"
+    if (
+        interval is None
+        or not math.isfinite(start)
+        or not math.isfinite(end)
+        or end < start
+    ):
+        return "unknown"
+    span_start, span_end = interval
+    return span_start < end and span_end > start
+
+
+def analyze_murphy_fault(result: dict[str, Any]) -> dict[str, Any]:
+    """Build a deterministic, evidence-only analysis for one queried fault."""
+    fault = result.get("fault")
+    if not fault:
+        return {
+            "fault_duration_seconds": None,
+            "overlapping_traces": [],
+            "overlapping_spans": [],
+            "breakdown": [],
+            "parent_child_paths": [],
+            "unresolved_parent_evidence": [],
+            "sample_only_spans": [],
+            "unknown_timestamp_spans": [],
+            "conclusion": "The selected fault was not found in the research graph.",
+        }
+
+    try:
+        fault_start = float(fault["start_time"])
+        fault_end = float(fault["end_time"])
+        duration = fault_end - fault_start
+    except (KeyError, TypeError, ValueError, OverflowError):
+        fault_start = fault_end = None
+        duration = None
+
+    overlapping: list[dict[str, Any]] = []
+    sample_only: list[dict[str, Any]] = []
+    unknown_timestamp: list[dict[str, Any]] = []
+    for span in result.get("spans", []):
+        overlap = (
+            _exact_fault_overlap(span, fault_start, fault_end)
+            if fault_start is not None
+            else "unknown"
+        )
+        span["overlaps_selected_fault"] = overlap
+        if overlap is True:
+            overlapping.append(span)
+        elif overlap == "unknown":
+            unknown_timestamp.append(span)
+        else:
+            sample_only.append(span)
+
+    breakdown_counter: Counter[tuple[str, str]] = Counter()
+    for span in overlapping:
+        service = span.get("mapped_service") or span.get("service_name") or "Unknown"
+        operation = span.get("operation_name") or "Unknown"
+        breakdown_counter[(service, operation)] += 1
+
+    parent_child_paths = [
+        {
+            "trace_id": span.get("trace_id"),
+            "parent_span_id": (
+                span.get("resolved_parent_span_id")
+                or span.get("parent_span_id")
+                or "Unknown"
+            ),
+            "span_id": span.get("original_span_id"),
+            "source_file": span.get("source_file") or "Unknown",
+        }
+        for span in overlapping
+        if span.get("resolved_parent_span_id")
+    ]
+    unresolved_parent_evidence = [
+        span.get("parent_span_id")
+        for span in overlapping
+        if span.get("parent_span_id") and not span.get("resolved_parent_span_id")
+    ]
+    trace_ids = sorted({str(span.get("trace_id")) for span in overlapping})
+    span_ids = sorted({str(span.get("original_span_id")) for span in overlapping})
+
+    if not overlapping:
+        conclusion = (
+            "No imported span overlaps the selected fault interval in the "
+            "bounded research sample."
+        )
+    else:
+        conclusion = (
+            f"{len(overlapping)} imported span(s) across {len(trace_ids)} "
+            "trace(s) overlap the selected fault interval. This is measured "
+            "temporal overlap only and does not establish causality."
+        )
+
+    return {
+        "fault_duration_seconds": duration,
+        "overlapping_traces": trace_ids,
+        "overlapping_spans": span_ids,
+        "overlapping_span_records": overlapping,
+        "breakdown": [
+            {
+                "Service mapping": service,
+                "Operation": operation,
+                "Overlapping spans": count,
+            }
+            for (service, operation), count in sorted(breakdown_counter.items())
+        ],
+        "parent_child_paths": parent_child_paths,
+        "unresolved_parent_evidence": unresolved_parent_evidence,
+        "sample_only_spans": sample_only,
+        "unknown_timestamp_spans": unknown_timestamp,
+        "conclusion": conclusion,
+    }
 
 
 def _safe_database_error(exc: Exception) -> str:

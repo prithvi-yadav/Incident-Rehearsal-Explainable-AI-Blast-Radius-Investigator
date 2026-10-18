@@ -9,7 +9,12 @@ from typing import Any
 import streamlit as st
 
 from agent import investigate_incident
-from tools import get_service_graph_data
+from tools import (
+    analyze_murphy_fault,
+    get_murphy_fault_investigation,
+    get_murphy_faults,
+    get_service_graph_data,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -659,6 +664,183 @@ def main() -> None:
         else:
             st.info(
                 "Run an investigation from the Overview tab to generate a report."
+            )
+
+    with st.expander("Murphy Fault Investigator", expanded=False):
+        st.subheader("Murphy Fault Investigator")
+        st.caption(
+            "Explore bounded research evidence from the isolated "
+            "`incident_rehearsal_research` graph. These are experimental "
+            "DeathStarBench observations with injected faults, not production "
+            "incidents."
+        )
+        if st.button("Load recorded Murphy faults", width="stretch"):
+            try:
+                st.session_state["murphy_faults"] = get_murphy_faults()
+                st.session_state.pop("murphy_fault_result", None)
+            except Exception:
+                logger.exception("Unable to load Murphy research faults")
+                st.error(
+                    "The Murphy research graph could not be queried. "
+                    "Check that the isolated research graph is available."
+                )
+
+        murphy_faults = st.session_state.get("murphy_faults", [])
+        if murphy_faults:
+            fault_options = {
+                (
+                    f"{fault['phase']} · {fault['target_entity']} · "
+                    f"{fault['start_time']}–{fault['end_time']}"
+                ): fault
+                for fault in murphy_faults
+            }
+            selected_fault_label = st.selectbox(
+                "Recorded fault",
+                options=list(fault_options),
+                key="murphy_fault_selection",
+            )
+            selected_fault = fault_options[selected_fault_label]
+            if st.button("Investigate recorded fault", width="stretch"):
+                try:
+                    st.session_state["murphy_fault_result"] = (
+                        get_murphy_fault_investigation(selected_fault["id"])
+                    )
+                except Exception:
+                    logger.exception("Unable to investigate Murphy fault")
+                    st.error(
+                        "The recorded fault could not be investigated from "
+                        "the research graph."
+                    )
+
+            result = st.session_state.get("murphy_fault_result")
+            if result and (result.get("fault") or {}).get("id") == selected_fault["id"]:
+                fault = result["fault"]
+                analysis = analyze_murphy_fault(result)
+                duration = analysis["fault_duration_seconds"]
+                duration_text = (
+                    f"{duration:g} seconds"
+                    if duration is not None
+                    else "unknown"
+                )
+                st.markdown(
+                    f"**Fault target:** `{fault['target_entity']}`  \n"
+                    f"**Interval:** `{fault['start_time']}` – "
+                    f"`{fault['end_time']}` Unix seconds  \n"
+                    f"**Category:** `{fault['fault_category']}`  \n"
+                    f"**Phase:** `{fault['phase']}`  \n"
+                    f"**Duration:** `{duration_text}`"
+                )
+                st.markdown("**Evidence-based investigation summary**")
+                summary_columns = st.columns(3)
+                summary_columns[0].metric(
+                    "Overlapping traces",
+                    len(analysis["overlapping_traces"]),
+                )
+                summary_columns[1].metric(
+                    "Overlapping spans",
+                    len(analysis["overlapping_spans"]),
+                )
+                summary_columns[2].metric(
+                    "Bounded sample spans",
+                    len(result.get("spans", [])),
+                )
+                st.info(analysis["conclusion"])
+                if analysis["breakdown"]:
+                    st.markdown("**Service and operation breakdown**")
+                    st.table(analysis["breakdown"])
+                if analysis["overlapping_spans"]:
+                    st.markdown(
+                        "**Supporting trace evidence**  \n"
+                        f"Trace IDs: `{', '.join(analysis['overlapping_traces'])}`  \n"
+                        f"Span IDs: `{', '.join(analysis['overlapping_spans'])}`"
+                    )
+                if analysis["parent_child_paths"]:
+                    st.markdown("**Explicit parent-child trace paths**")
+                    st.table(
+                        [
+                            {
+                                "Trace": path["trace_id"],
+                                "Parent span": path["parent_span_id"],
+                                "Overlapping span": path["span_id"],
+                                "Source": path["source_file"],
+                            }
+                            for path in analysis["parent_child_paths"]
+                        ]
+                    )
+                if analysis["unresolved_parent_evidence"]:
+                    st.caption(
+                        f"{len(analysis['unresolved_parent_evidence'])} "
+                        "overlapping span(s) reference a parent span that was "
+                        "not present in the bounded imported sample; no path "
+                        "was inferred."
+                    )
+                if analysis["sample_only_spans"] or analysis["unknown_timestamp_spans"]:
+                    st.markdown("**Evidence boundary**")
+                    st.caption(
+                        f"{len(analysis['sample_only_spans'])} span(s) are in "
+                        "the bounded sample but do not overlap this exact fault; "
+                        f"{len(analysis['unknown_timestamp_spans'])} span(s) "
+                        "have missing or ambiguous timestamps."
+                    )
+                st.markdown(
+                    "**Evidence versus inference**  \n"
+                    "Measured evidence includes the selected fault interval, "
+                    "Jaeger span timestamps, operation names, process service "
+                    "mappings, source files, and explicit parent-child "
+                    "references. The bounded sample does not establish "
+                    "production impact, service causality, baseline behavior, "
+                    "CPU or memory effects, ownership, deployments, or "
+                    "runbooks. Temporal overlap alone does not prove that the "
+                    "injected fault caused any span behavior."
+                )
+                spans = result.get("spans", [])
+                if not spans:
+                    st.warning(
+                        "No suitable traces or spans were found in the bounded "
+                        "research sample for this fault."
+                    )
+                else:
+                    st.markdown("**Measured trace evidence**")
+                    st.table(
+                        [
+                            {
+                                "Trace": span["trace_id"],
+                                "Span": span["original_span_id"],
+                                "Parent span": (
+                                    span["resolved_parent_span_id"]
+                                    or span["parent_span_id"]
+                                    or "Not resolved"
+                                ),
+                                "Service mapping": (
+                                    span["mapped_service"]
+                                    or span["service_name"]
+                                    or "Unknown"
+                                ),
+                                "Operation": span["operation_name"] or "Unknown",
+                                "Overlaps selected fault": span.get(
+                                    "overlaps_selected_fault", "unknown"
+                                ),
+                                "Source": span["source_file"],
+                            }
+                            for span in spans
+                        ]
+                    )
+                    st.info(
+                        "Temporal overlap is a measured relationship between "
+                        "recorded intervals. It does not prove that the injected "
+                        "fault caused the observed span behavior, nor that this "
+                        "benchmark represents a production outage."
+                    )
+                    st.markdown(
+                        "**Evidence boundary:** Parent-child references and "
+                        "Jaeger process mappings are recorded trace facts. "
+                        "Production ownership, deployments, runbooks, and "
+                        "causal conclusions are unknown from this dataset."
+                    )
+        else:
+            st.info(
+                "Load the recorded Murphy faults to query the isolated research "
+                "graph. No database writes or Gemini calls are made."
             )
 
 

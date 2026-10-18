@@ -9,3 +9,10 @@ __pycache__/
 htmlcov/
 .coverage
 .DS_Store
+
+# Murphy research archives and extracted trace data
+*.tar
+*.tar.gz
+prom_data_10s.json
+traces*.json
+MurphyResearch/
