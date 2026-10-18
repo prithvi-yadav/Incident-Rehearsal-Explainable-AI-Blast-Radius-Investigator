@@ -143,6 +143,34 @@ def get_murphy_faults() -> list[dict[str, Any]]:
     ]
 
 
+def get_murphy_research_counts() -> dict[str, int]:
+    """Return bounded research-graph label counts without changing the graph."""
+    result = _research_graph().ro_query(
+        """
+        MATCH (dataset:ResearchDataset)
+        WITH count(dataset) AS datasets
+        OPTIONAL MATCH (run:ResearchRun)
+        WITH datasets, count(run) AS runs
+        OPTIONAL MATCH (fault:FaultInjection)
+        WITH datasets, runs, count(fault) AS faults
+        OPTIONAL MATCH (trace:ResearchTrace)
+        WITH datasets, runs, faults, count(trace) AS traces
+        OPTIONAL MATCH (span:ResearchSpan)
+        RETURN datasets, runs, faults, traces, count(span) AS spans
+        """
+    )
+    if not result.result_set:
+        return {}
+    row = result.result_set[0]
+    return {
+        "datasets": int(_row_value(row, 0) or 0),
+        "runs": int(_row_value(row, 1) or 0),
+        "faults": int(_row_value(row, 2) or 0),
+        "traces": int(_row_value(row, 3) or 0),
+        "spans": int(_row_value(row, 4) or 0),
+    }
+
+
 def get_murphy_fault_investigation(fault_id: str) -> dict[str, Any]:
     """Return fault, trace, span, parent, and mapped-service evidence."""
     graph = _research_graph()
@@ -151,9 +179,10 @@ def get_murphy_fault_investigation(fault_id: str) -> dict[str, Any]:
         MATCH (run:ResearchRun)-[:HAS_FAULT]->(fault:FaultInjection)
         WHERE fault.id = $fault_id
         OPTIONAL MATCH (fault)-[:TARGETS]->(target:ResearchComponent)
+        OPTIONAL MATCH (target)-[:MAPPED_TO_SERVICE]->(target_service:ResearchService)
         RETURN run.id, fault.id, fault.start_time, fault.end_time,
                fault.target_entity, fault.fault_category, fault.phase,
-               target.id
+               target.id, target_service.name
         """,
         params={"fault_id": fault_id},
     )
@@ -170,9 +199,11 @@ def get_murphy_fault_investigation(fault_id: str) -> dict[str, Any]:
         WHERE fault.id = $fault_id
         OPTIONAL MATCH (span)-[:MAPPED_TO_SERVICE]->(service:ResearchService)
         OPTIONAL MATCH (parent:ResearchSpan)-[:PARENT_OF]->(span)
+        OPTIONAL MATCH (parent)-[:MAPPED_TO_SERVICE]->(parent_service:ResearchService)
         RETURN trace.id, span.id, span.original_span_id,
                span.parent_span_id, parent.original_span_id,
-               span.process_id, span.service_name, service.name,
+               parent_service.name, span.process_id, span.service_name,
+               service.name,
                span.operation_name, span.start_time,
                span.start_time_microseconds, span.duration_microseconds,
                span.overlaps_fault, span.source_file
@@ -190,6 +221,7 @@ def get_murphy_fault_investigation(fault_id: str) -> dict[str, Any]:
             "fault_category": _row_value(row, 5),
             "phase": _row_value(row, 6),
             "target_component": _row_value(row, 7),
+            "target_mapped_service": _row_value(row, 8),
         },
         "spans": [
             {
@@ -198,15 +230,16 @@ def get_murphy_fault_investigation(fault_id: str) -> dict[str, Any]:
                 "original_span_id": _row_value(span, 2),
                 "parent_span_id": _row_value(span, 3),
                 "resolved_parent_span_id": _row_value(span, 4),
-                "process_id": _row_value(span, 5),
-                "service_name": _row_value(span, 6),
-                "mapped_service": _row_value(span, 7),
-                "operation_name": _row_value(span, 8),
-                "start_time": _row_value(span, 9),
-                "start_time_microseconds": _row_value(span, 10),
-                "duration_microseconds": _row_value(span, 11),
-                "stored_overlaps_fault": _row_value(span, 12),
-                "source_file": _row_value(span, 13),
+                "parent_mapped_service": _row_value(span, 5),
+                "process_id": _row_value(span, 6),
+                "service_name": _row_value(span, 7),
+                "mapped_service": _row_value(span, 8),
+                "operation_name": _row_value(span, 9),
+                "start_time": _row_value(span, 10),
+                "start_time_microseconds": _row_value(span, 11),
+                "duration_microseconds": _row_value(span, 12),
+                "stored_overlaps_fault": _row_value(span, 13),
+                "source_file": _row_value(span, 14),
             }
             for span in spans_result.result_set
         ],

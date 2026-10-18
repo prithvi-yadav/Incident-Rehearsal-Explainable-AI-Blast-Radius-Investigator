@@ -1,220 +1,180 @@
 # Incident Rehearsal
 
-> **AI-powered blast-radius investigation for software incidents, backed by a FalkorDB graph containing synthetic demonstration data.**
+> **Explainable graph investigation for service incidents and bounded research
+> fault evidence.**
 
-Incident Rehearsal helps engineers investigate a reported software incident by tracing service dependencies, measuring potential blast radius, retrieving operational evidence, and rehearsing hypothetical dependency isolation without changing the stored graph.
+Incident Rehearsal helps a developer answer a practical incident question:
+**which services are structurally exposed, what evidence is recorded around
+the selected service or fault, and what remains unknown?**
 
-Built for **Graph Hacks: Context for AI Agents** by WeMakeDevs and FalkorDB.
+The application uses FalkorDB graph traversal rather than a static list of
+services. It has two intentionally separate workflows:
 
-This repository and its documentation were prepared with assistance from an AI
-coding assistant. All implementation claims and setup notes should be reviewed
-against the source code and local environment before production use.
+1. **Incident Rehearsal** explores a small synthetic service graph, measures
+   dependency blast radius, and compares hypothetical dependency removal in
+   memory.
+2. **Murphy Research** investigates a bounded sample of experimental
+   DeathStarBench traces with injected faults.
 
-[![Python](https://img.shields.io/badge/Python-3.13%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.66.0-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
-[![FalkorDB](https://img.shields.io/badge/FalkorDB-graph_database-7B61FF)](https://www.falkordb.com/)
-[![LangChain](https://img.shields.io/badge/LangChain-agent-1C3C3C)](https://www.langchain.com/)
-[![Gemini](https://img.shields.io/badge/Google%20Gemini-LLM-4285F4?logo=google&logoColor=white)](https://ai.google.dev/)
+The research workflow is not live production telemetry, and the synthetic
+records are not real operational data.
 
-## Table of contents
+This project was built for the [Graph Hacks: Context for AI
+Agents](https://github.com/falkordb/graph-hacks) hackathon. The repository and
+documentation were prepared with assistance from an AI coding assistant. The
+implementation and setup notes should be reviewed against the source and
+environment before production use.
 
-- [Problem statement](#problem-statement)
-- [Key features](#key-features)
-- [Architecture](#architecture)
-- [Technology stack](#technology-stack)
-- [Graph data model](#graph-data-model)
-- [Cypher queries and algorithms](#cypher-queries-and-algorithms)
-- [Installation and local setup](#installation-and-local-setup)
-- [Using the application](#using-the-application)
-- [Verification and testing](#verification-and-testing)
-- [Evidence and safety boundaries](#evidence-and-safety-boundaries)
-- [Project structure](#project-structure)
-- [Limitations and future work](#limitations-and-future-work)
-- [License](#license)
+## Features
 
-## Problem statement
+### Synthetic incident investigation
 
-During an outage, responders need more than a list of services. They need to understand:
+- Overview of service health, dependency relationships, and focus-service
+  metrics.
+- Read-only FalkorDB queries for impacted services, direct dependencies,
+  deployments, historical incidents, owners, and runbooks.
+- Bounded dependency traversal and structural blast-radius measurements.
+- A deterministic **Incident Rehearsal** workflow that compares reachability
+  before and after removing one actual incoming dependency edge from an
+  in-memory copy.
+- Automatic comparison of all candidate incoming edges, ranked by lost
+  reachability.
+- Evidence-grounded Gemini/LangChain investigation reports with a deterministic
+  graph-tool fallback when Gemini quota exhaustion is detected.
 
-- Which services depend directly or indirectly on the affected service.
-- How many unique services may be exposed through those dependency paths.
-- Whether a recent deployment is relevant to the incident timeline.
-- Whether a previous incident contains documented causes or resolutions.
-- Who owns the service and where its operational runbook is located.
+### Murphy research investigation
 
-Incident Rehearsal combines these records in FalkorDB and presents them through a Streamlit interface. A LangChain agent can gather the evidence and write a structured report. When Gemini quota exhaustion is detected, the application can produce a deterministic report directly from the same graph tools without making another LLM call.
+- Recorded-fault selector backed by the isolated
+  `incident_rehearsal_research` graph.
+- Exact overlap analysis for the selected fault interval using stored Jaeger
+  timestamps.
+- Counts of overlapping traces and spans, service/operation breakdown, trace
+  IDs, span IDs, source files, and explicit parent-child evidence.
+- A Graphviz trace-topology view derived only from recorded service mappings
+  and explicit parent-child span relationships.
+- Honest handling of unresolved target identities, missing parent spans, and
+  unknown timestamps.
+- Clear separation of measured evidence, possible relevance, and unknown
+  information.
 
-The application deliberately does **not** treat a dependency path as proof that a service is failing, that a dependency is synchronous or business-critical, or that a particular event caused the incident. Graph relationships describe structural exposure and investigation clues; responders must validate real-world behavior separately.
+### Visualization boundaries
 
-## Key features
+The application uses rendered Graphviz diagrams. They are not clickable node
+canvases. In the synthetic workflow, select or focus a service through the
+Streamlit controls; the graph, metrics, and evidence update for that focus.
+The Murphy topology is a separate rendered view and does not invent edges when
+the bounded research sample cannot justify them.
 
-### FalkorDB-powered service graph
+## The two datasets
 
-- Uses the `incident_investigator` FalkorDB graph.
-- Reads service nodes, recorded statuses, and `DEPENDS_ON` relationships for the live dependency visualization.
-- Uses read-only `ro_query()` calls for investigation tools.
+The graphs are separate by design. The application does not merge their
+schemas or treat research observations as operational facts.
 
-### LangChain investigation agent
+### Synthetic demonstration graph
 
-The Gemini-powered agent is created with the predefined tools in `incident_tools`:
+**Graph:** `incident_investigator`
 
-1. `get_impacted_services`
-2. `get_service_dependencies`
-3. `get_service_blast_radius`
-4. `get_recent_deployments`
-5. `get_historical_incidents`
-6. `get_service_owner_and_runbook`
+The graph contains five fictional services:
 
-The agent is instructed to separate reporter observations, FalkorDB facts, unproven hypotheses, and unknown information.
+- `MobileAPI`
+- `Checkout`
+- `CartService`
+- `AuthService`
+- `UserDB`
 
-### Dependency and blast-radius analysis
+It also contains synthetic health states, dependency edges, and
+`AuthService` evidence for a developer, deployment, historical incident, and
+runbook. This graph demonstrates dependency direction, blast-radius
+calculation, and hypothetical scenarios. It is not production telemetry.
 
-- Traverses impacted-service paths up to five hops.
-- Measures blast radius up to three hops.
-- Counts unique dependent services rather than paths.
-- Assigns each dependent its shortest path distance.
-- Separates direct dependents from indirect dependents.
-- Reports the maximum shortest-path distance and actual graph paths.
+The seeded dependency relationships are:
 
-### Operational evidence retrieval
-
-The tools retrieve, where present:
-
-- Recent deployments within the previous 24 hours, with safe timestamp parsing.
-- Historical incidents, documented root causes, and resolutions.
-- Service maintainers, email addresses, on-call status, and runbooks.
-
-### Deterministic Gemini-quota fallback
-
-If the Gemini path clearly reports HTTP `429` or `RESOURCE_EXHAUSTED` quota exhaustion, `agent.py` invokes the existing graph tools directly in Python and creates an evidence-only Markdown report. Unrelated programming errors and FalkorDB failures are not silently classified as quota exhaustion.
-
-### Incident Rehearsal
-
-The Incident Rehearsal tab:
-
-- Selects an actual incoming dependency edge for the focused service.
-- Removes exactly that directed edge from an in-memory copy of the edge list.
-- Recomputes before-and-after reachability and blast-radius measurements.
-- Shows Before and After Graphviz panels.
-- Highlights the selected service, remaining reachable dependents, and dependents that are no longer reachable.
-- Does not write to FalkorDB and does not call Gemini.
-
-### Automatic Scenario Analyzer
-
-The `Compare All Scenarios` action evaluates every actual incoming edge to the selected service, ranks scenarios by the number of dependent services that become unreachable, and uses a deterministic alphabetical tie-breaker. Results can be selected to view the same Before/After graphs and metrics.
-
-The ranking is a graph-reachability comparison, not a recommended production fix or a safety guarantee.
-
-### Streamlit dashboard and report download
-
-The Streamlit page provides:
-
-- Overview, Incident Rehearsal, and Investigation Report tabs.
-- A focus-service selector populated from FalkorDB.
-- A hierarchical left-to-right 2D Graphviz graph.
-- Status-colored service nodes and focused-service highlighting.
-- A complete Markdown report and a Markdown download button.
-
-### Murphy Fault Investigator
-
-The optional Murphy Fault Investigator reads bounded research evidence from a
-separate FalkorDB graph named `incident_rehearsal_research`. It does not seed
-or query the production `incident_investigator` graph, call Gemini, or run
-database writes when the Streamlit application starts.
-
-The standalone [`import_murphy_traces.py`](D:/graph-hacks/import_murphy_traces.py)
-parses the small run metadata and a bounded set of fault-overlapping Jaeger
-spans from a selected `compute-12.tar.gz` archive. Prometheus data is
-intentionally not imported in this first pilot because its identity joins have
-not been validated. Dry-run mode is the default:
-
-```powershell
-python .\import_murphy_traces.py `
-  --archive D:\MurphyResearch\pilot\compute-faults\compute-12.tar.gz `
-  --max-traces 5 `
-  --max-spans 100
+```text
+MobileAPI  -> Checkout
+Checkout   -> AuthService
+CartService -> AuthService
+AuthService -> UserDB
 ```
 
-The importer reports parsed counts without writing. A future reviewed import
-requires the explicit `--write` flag and still rejects
-`incident_investigator` as a target. Use only the isolated research graph:
+Here `A -> B` means **A depends on B**. Therefore, when `AuthService` is the
+focus, `Checkout`, `CartService`, and `MobileAPI` are reached by following
+incoming dependency paths toward `AuthService`.
 
-```powershell
-python .\import_murphy_traces.py `
-  --archive D:\MurphyResearch\pilot\compute-faults\compute-12.tar.gz `
-  --max-traces 5 `
-  --max-spans 100 `
-  --write
-```
+### Murphy research graph
 
-The Murphy mode displays exact fault targets and intervals, bounded trace/span
-evidence, parent-span identifiers, Jaeger service mappings, source files, and
-temporal overlap. Temporal overlap is not proof of causality, and benchmark
-container names are not silently converted into production services.
+**Graph:** `incident_rehearsal_research`
 
-The source is the CC0 Murphy traces dataset from the [University of Illinois
-Data Bank](https://databank.illinois.edu/datasets/IDB-6641912), using the
-DeathStarBench `hotel-reserv` benchmark. The data represents experimental
-benchmark measurements with injected failures, not live production telemetry.
+The pilot is based on the [Murphy traces dataset at the University of Illinois
+Data Bank](https://databank.illinois.edu/datasets/IDB-6641912).
+
+- DOI: `10.13012/B2IDB-6641912_V1`
+- Dataset license: CC0, as stated by the dataset record.
+- Benchmark: DeathStarBench `hotel-reserv`.
+- Fault families in the source data include experimentally injected compute,
+  memory, and disk faults.
+
+The current bounded pilot imported:
+
+| Record | Count |
+|---|---:|
+| Research datasets | 1 |
+| Research runs | 1 |
+| Fault records | 6 |
+| Unique research components | 4 |
+| Research traces | 5 |
+| Research spans | 55 |
+
+Read-only verification of the current graph also found six recorded research
+services and 17 stored parent-child relationships. The pilot deliberately did
+**not** import Prometheus metrics or `wrkOutput`. The application therefore
+does not currently detect CPU or memory anomalies from those unimported
+metrics, and it does not claim production impact.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    UI[Streamlit UI]
-    Agent[LangChain agent]
-    Tools[Predefined Python tools]
-    Graph[(FalkorDB<br/>incident_investigator)]
-    Fallback[Deterministic Python report<br/>on Gemini quota exhaustion]
-    Sim[In-memory rehearsal simulation]
-
-    UI -->|incident + focus service| Agent
-    Agent -->|tool calls| Tools
-    Tools -->|read-only Cypher| Graph
-    Tools -->|evidence| Agent
-    Agent -->|structured report| UI
-    Agent -.->|429 / RESOURCE_EXHAUSTED| Fallback
-    Fallback -->|reuse tools| Tools
-    UI -->|selected edge| Sim
-    Sim -->|copy edges, remove one edge| UI
+    User[Developer] --> UI[Streamlit app.py]
+    UI --> Helpers[Python analysis helpers]
+    Helpers -->|read-only ro_query| Synthetic[(FalkorDB<br/>incident_investigator)]
+    Helpers -->|read-only ro_query| Research[(FalkorDB<br/>incident_rehearsal_research)]
+    UI --> Agent[LangChain agent.py]
+    Agent --> Gemini[Google Gemini]
+    Agent --> Helpers
+    Importer[import_murphy_traces.py] -->|explicit --write only| Research
+    Seed[seed_graph.py] -->|writes synthetic demo data| Synthetic
+    Tests[test_murphy_importer.py] --> Importer
 ```
 
-The graph visualization and rehearsal calculations use graph data loaded by the UI. Rehearsal removes an edge only from an in-memory Python list; it never issues a database mutation.
+### Components
 
-## Technology stack
+- [`app.py`](./app.py) is the Streamlit entry point. It renders Overview,
+  Incident Rehearsal, Murphy Research, and Investigation Report sections.
+- [`tools.py`](./tools.py) owns the shared lazy FalkorDB connection, read-only
+  Cypher helpers, LangChain tools, Murphy evidence retrieval, and exact
+  selected-fault analysis.
+- [`agent.py`](./agent.py) creates the Gemini LangChain agent for the synthetic
+  incident workflow. It instructs the model to distinguish graph facts,
+  reporter observations, hypotheses, and unknowns.
+- [`import_murphy_traces.py`](./import_murphy_traces.py) parses a bounded
+  archive sample. It defaults to dry-run mode and writes only with an explicit
+  `--write`.
+- [`seed_graph.py`](./seed_graph.py) creates or updates the fictional
+  `incident_investigator` demo graph. It must not be used to populate the
+  Murphy research graph.
+- [`test_murphy_importer.py`](./test_murphy_importer.py) contains focused tests
+  for parsing, timestamp overlap, topology evidence, importer bounds, and the
+  production-graph safety guard.
 
-| Technology | Role |
-|---|---|
-| Python | Application, graph algorithms, scripts, and deterministic report generation |
-| Streamlit | Dashboard layout, tabs, controls, Graphviz rendering, report display, and download |
-| FalkorDB | Property-graph storage and read-only Cypher queries |
-| Cypher | Service dependency and operational-evidence queries |
-| LangChain | Tool definitions and agent orchestration |
-| Google Gemini | Preferred LLM investigation path through `langchain-google-genai` |
-| Graphviz | 2D dependency graph rendering through Streamlit's `st.graphviz_chart()` |
-| `python-dotenv` | Loads local Gemini and FalkorDB configuration from `.env` |
+Gemini is used only by the synthetic incident report workflow. Murphy
+investigation is deterministic and graph-backed; it does not require an LLM
+call.
 
-`requirements.txt` uses exact `==` version pins. The current local virtual environment was inspected on October 17, 2026 and reported:
+## Graph schemas and important queries
 
-| Package | Installed version |
-|---|---:|
-| `falkordb` | 1.7.1 |
-| `streamlit` | 1.66.0 |
-| `langchain` | 1.4.4 |
-| `langchain-core` | 1.6.9 |
-| `langchain-google-genai` | 4.4.1 |
-| `google-genai` | 2.29.0 |
-| `python-dotenv` | 1.2.4 |
-| `pydantic` | 2.14.0 |
-| `rich` | 15.0.0 |
+### Synthetic graph schema
 
-## Graph data model
-
-The graph is seeded by `seed_graph.py` with synthetic demonstration data. It is not production telemetry.
-
-### Node labels and properties
-
-| Label | Properties used |
+| Label | Important properties |
 |---|---|
 | `Service` | `id`, `name`, `status` |
 | `Developer` | `id`, `name`, `email`, `on_call` |
@@ -222,64 +182,44 @@ The graph is seeded by `seed_graph.py` with synthetic demonstration data. It is 
 | `PastIncident` | `id`, `title`, `root_cause`, `resolution` |
 | `Runbook` | `id`, `title`, `url` |
 
-### Relationship types
-
 | Relationship | Direction and meaning |
 |---|---|
-| `DEPENDS_ON` | `Service` → `Service`; A depends on B |
-| `MAINTAINED_BY` | `Service` → `Developer` |
-| `DEPLOYED_TO` | `Deployment` → `Service` |
-| `AFFECTED` | `PastIncident` → `Service` |
-| `DOCUMENTED_IN` | `Service` → `Runbook` |
+| `DEPENDS_ON` | `Service -> Service`; the source depends on the target |
+| `MAINTAINED_BY` | `Service -> Developer` |
+| `DEPLOYED_TO` | `Deployment -> Service` |
+| `AFFECTED` | `PastIncident -> Service` |
+| `DOCUMENTED_IN` | `Service -> Runbook` |
 
-The dependency direction is important:
+### Research graph schema
 
-```text
-A → B means service A depends on service B.
-```
+The importer creates isolated research labels and relationships:
 
-For a selected target `B`, impacted services are found by following incoming paths from dependent services toward `B`.
+| Label | Purpose |
+|---|---|
+| `ResearchDataset` | Dataset metadata and DOI |
+| `ResearchRun` | Bounded archive/run metadata |
+| `FaultInjection` | Fault interval, target, category, and phase |
+| `ResearchComponent` | Recorded fault target component |
+| `ResearchTrace` | Bounded trace record |
+| `ResearchSpan` | Jaeger span and provenance fields |
+| `ResearchService` | Service identity recorded by Jaeger mappings |
 
-```mermaid
-graph LR
-    MobileAPI[Service<br/>MobileAPI] -->|DEPENDS_ON| Checkout[Service<br/>Checkout]
-    Checkout -->|DEPENDS_ON| Auth[Service<br/>AuthService]
-    Cart[Service<br/>CartService] -->|DEPENDS_ON| Auth
-    Auth -->|DEPENDS_ON| UserDB[Service<br/>UserDB]
+| Relationship | Meaning |
+|---|---|
+| `HAS_RUN` | Dataset -> research run |
+| `HAS_FAULT` | Run -> fault |
+| `TARGETS` | Fault -> target component |
+| `HAS_TRACE` | Run -> trace |
+| `HAS_SPAN` | Trace -> span |
+| `PARENT_OF` | Parent span -> child span |
+| `MAPPED_TO_SERVICE` | Span or component -> recorded research service |
 
-    Deploy[Deployment] -->|DEPLOYED_TO| Auth
-    Past[PastIncident] -->|AFFECTED| Auth
-    Auth -->|MAINTAINED_BY| Alice[Developer]
-    Auth -->|DOCUMENTED_IN| Runbook[Runbook]
-```
+### Representative Cypher
 
-The current seed data creates five services and four dependency edges:
+The application binds user-selected values as parameters and uses
+`graph.ro_query(...)` for investigation reads.
 
-- `MobileAPI → Checkout`
-- `Checkout → AuthService`
-- `CartService → AuthService`
-- `AuthService → UserDB`
-
-It also creates synthetic AuthService evidence for Alice, deployment `deploy-v2.4`, incident `INC-88`, and runbook `RB-AUTH-01`.
-
-## Cypher queries and algorithms
-
-The following examples are representative of the exact parameterized queries implemented in `tools.py`.
-
-### Direct dependencies of a service
-
-```cypher
-MATCH p = (service:Service)-[:DEPENDS_ON]->(dependency:Service)
-WHERE service.name = $service_name
-RETURN p,
-       service.name,
-       dependency.name,
-       dependency.status
-```
-
-This follows outgoing edges from the selected service to identify what it depends on.
-
-### Direct and indirect dependents
+**Service blast radius / impacted paths:**
 
 ```cypher
 MATCH p = (dependent:Service)-[:DEPENDS_ON*1..5]->(target:Service)
@@ -288,143 +228,136 @@ RETURN p, length(p) AS hops
 ORDER BY hops, dependent.name
 ```
 
-This returns graph paths leading to the selected target. The blast-radius tool uses a similar read-only query bounded to `1..3` hops and includes dependent identifiers and names.
+The deterministic blast-radius helper uses the same incoming dependency
+direction with a three-hop bound, records each service once at its shortest
+distance, and counts direct versus indirect dependents.
 
-### Recent deployments
-
-```cypher
-MATCH p = (deployment:Deployment)-[:DEPLOYED_TO]->(service:Service)
-WHERE service.name = $service_name
-RETURN p,
-       deployment.version,
-       deployment.commit_hash,
-       deployment.timestamp,
-       deployment.description
-```
-
-Python parses ISO 8601 values and Unix timestamps in seconds. Only timestamps between the current UTC time and 24 hours earlier are reported as recent. Missing, invalid, and out-of-range timestamps are skipped and reported.
-
-### Historical incidents
+**Direct service dependencies:**
 
 ```cypher
-MATCH p = (incident:PastIncident)-[:AFFECTED]->(service:Service)
+MATCH p = (service:Service)-[:DEPENDS_ON]->(dependency:Service)
 WHERE service.name = $service_name
-RETURN p,
-       incident.id,
-       incident.title,
-       incident.root_cause,
-       incident.resolution
-LIMIT 20
+RETURN p, service.name, dependency.name, dependency.status
 ```
 
-### Service owners and runbooks
-
-Owners and runbooks use separate queries so missing owners do not hide runbooks and vice versa:
+**Research fault lookup and target mapping:**
 
 ```cypher
-MATCH p = (service:Service)-[:MAINTAINED_BY]->(developer:Developer)
-WHERE service.name = $service_name
-RETURN p,
-       developer.name,
-       developer.email,
-       developer.on_call
+MATCH (run:ResearchRun)-[:HAS_FAULT]->(fault:FaultInjection)
+WHERE fault.id = $fault_id
+OPTIONAL MATCH (fault)-[:TARGETS]->(target:ResearchComponent)
+OPTIONAL MATCH (target)-[:MAPPED_TO_SERVICE]->(target_service:ResearchService)
+RETURN run.id, fault.id, fault.start_time, fault.end_time,
+       fault.target_entity, target.id, target_service.name
 ```
+
+**Research trace/span evidence and explicit parent evidence:**
 
 ```cypher
-MATCH p = (service:Service)-[:DOCUMENTED_IN]->(runbook:Runbook)
-WHERE service.name = $service_name
-RETURN p,
-       runbook.title,
-       runbook.url
+MATCH (run:ResearchRun)-[:HAS_FAULT]->(fault:FaultInjection)
+MATCH (run)-[:HAS_TRACE]->(trace:ResearchTrace)-[:HAS_SPAN]->(span:ResearchSpan)
+WHERE fault.id = $fault_id
+OPTIONAL MATCH (span)-[:MAPPED_TO_SERVICE]->(service:ResearchService)
+OPTIONAL MATCH (parent:ResearchSpan)-[:PARENT_OF]->(span)
+OPTIONAL MATCH (parent)-[:MAPPED_TO_SERVICE]->(parent_service:ResearchService)
+RETURN trace.id, span.id, span.parent_span_id,
+       parent.original_span_id, parent_service.name, service.name,
+       span.start_time_microseconds, span.duration_microseconds,
+       span.source_file
 ```
 
-All read-only tool queries use `graph.ro_query(...)`, bind `$service_name` as a parameter, and read rows through FalkorDB's `result.result_set`.
+FalkorDB is central because the investigation follows relationships:
+dependent-service paths, deployment-to-service evidence, fault-to-component
+links, trace/span membership, service mappings, and parent-child spans. A
+flat table could display the same fields, but it would not provide the
+relationship-constrained traversal that prevents unsupported topology claims.
 
-### Blast-radius algorithm
+## Installation and configuration
 
-The deterministic blast-radius calculation:
+The following commands are for Windows PowerShell.
 
-1. Builds an in-memory reverse adjacency map from each dependency target to its direct dependents.
-2. Starts at the selected service with distance zero.
-3. Performs breadth-first traversal through incoming edges up to three hops.
-4. Records each dependent service once at its shortest distance.
-5. Counts distance `1` as direct and distances greater than `1` as indirect.
-6. Uses the largest recorded shortest distance as the maximum distance.
-
-This prevents multiple paths to one service from inflating the unique dependent count.
-
-### Incident Rehearsal algorithm
-
-For a selected incoming edge, the UI copies the current edge list and removes exactly that `(source, target)` tuple. It then runs the same blast-radius and comparison helpers on the simulated list. The database is never changed.
-
-The comparison reports:
-
-- Services present before but absent after: no longer reachable.
-- Services present in both: remain affected.
-- Services present only after: newly reachable.
-
-## Installation and local setup
-
-The commands below are written for Windows PowerShell.
-
-### 1. Clone the repository
+### 1. Clone and create a virtual environment
 
 ```powershell
-git clone https://github.com/prithvi-yadav/Incident-Rehearsal-Explainable-AI-Blast-Radius-Investigator.git Incident-Rehearsal-Explainable-AI-Blast-Radius-Investigator
+git clone https://github.com/prithvi-yadav/Incident-Rehearsal-Explainable-AI-Blast-Radius-Investigator.git
 Set-Location .\Incident-Rehearsal-Explainable-AI-Blast-Radius-Investigator
-```
-
-The clone command and destination use the published repository:
-`https://github.com/prithvi-yadav/Incident-Rehearsal-Explainable-AI-Blast-Radius-Investigator`.
-The clone command was not run in this workspace.
-
-### 2. Create and activate a virtual environment
-
-```powershell
 py -3.13 -m venv venv
 .\venv\Scripts\Activate.ps1
 ```
 
-If PowerShell execution policy prevents activation, use an approved local policy change or invoke the interpreter directly as shown below. The project was inspected with Python 3.13.15, but a fresh environment setup was not run as part of the documentation update.
+If activation is blocked by local PowerShell policy, invoke
+`.\venv\Scripts\python.exe` directly instead.
 
-### 3. Install dependencies
+### 2. Install the pinned dependencies
 
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r .\requirements.txt
 ```
 
-The manifest uses exact pins. The versions listed in the technology table are
-the versions currently installed in the existing `venv`, matching the
-published `requirements.txt`.
+The current manifest pins FalkorDB `1.7.1`, Streamlit `1.66.0`, LangChain
+`1.4.4`, LangChain Core `1.6.9`, LangChain Google GenAI `4.4.1`,
+`google-genai` `2.29.0`, and the supporting packages.
 
-### 4. Configure FalkorDB
+### 3. Configure local environment variables
 
-For local development, the application defaults to `localhost:6379` and the
-`incident_investigator` graph. Copy `.env.example` to `.env` if you want to
-override those defaults or configure authentication/TLS:
+Copy the tracked template and edit the private local file:
+
+```powershell
+Copy-Item .\.env.example .\.env
+```
+
+The application and importer load `.env` through `python-dotenv`. `.env` is
+ignored by Git and must never contain a value that is copied into public
+documentation or committed.
+
+#### FalkorDB settings
+
+`tools.py`, `seed_graph.py`, and `import_murphy_traces.py` support these
+settings:
 
 | Variable | Purpose |
 |---|---|
-| `FALKORDB_URL` | Optional `falkor://` or `falkors://` endpoint; preferred for hosted instances |
-| `FALKORDB_HOST` / `FALKORDB_PORT` | Host and port fallback when `FALKORDB_URL` is not set |
-| `FALKORDB_GRAPH_NAME` | Graph name; defaults to `incident_investigator` |
-| `FALKORDB_USERNAME` / `FALKORDB_PASSWORD` | Optional authentication for explicit host/port configuration |
-| `FALKORDB_SSL` | Enable TLS for explicit host/port configuration |
-| `FALKORDB_SSL_CERT_REQS` | TLS certificate requirement, such as `required` |
-| `FALKORDB_SSL_CA_CERTS` / `FALKORDB_SSL_CA_PATH` / `FALKORDB_SSL_CA_DATA` | Optional CA configuration |
-| `FALKORDB_SSL_CERTFILE` / `FALKORDB_SSL_KEYFILE` | Optional client certificate and key |
-| `FALKORDB_SSL_PASSWORD` | Optional client-key password |
-| `FALKORDB_SSL_CHECK_HOSTNAME` | Enable TLS hostname checking |
-| `FALKORDB_SSL_VALIDATE_OCSP` / `FALKORDB_SSL_VALIDATE_OCSP_STAPLED` | Optional OCSP validation |
+| `FALKORDB_URL` | Optional `falkor://` or `falkors://` connection URL |
+| `FALKORDB_HOST` | Host fallback; defaults to `localhost` |
+| `FALKORDB_PORT` | Port fallback; defaults to `6379` |
+| `FALKORDB_GRAPH_NAME` | Synthetic graph selected by the app; defaults to `incident_investigator` |
+| `FALKORDB_USERNAME` | Optional database username |
+| `FALKORDB_PASSWORD` | Optional database password |
+| `FALKORDB_SSL` | Enables TLS for explicit host/port configuration |
+| `FALKORDB_SSL_CERT_REQS` | TLS certificate requirement |
+| `FALKORDB_SSL_CA_CERTS`, `FALKORDB_SSL_CA_PATH`, `FALKORDB_SSL_CA_DATA` | Optional CA configuration |
+| `FALKORDB_SSL_CERTFILE`, `FALKORDB_SSL_KEYFILE`, `FALKORDB_SSL_PASSWORD` | Optional client certificate configuration |
+| `FALKORDB_SSL_CHECK_HOSTNAME` | Enables TLS hostname checking |
+| `FALKORDB_SSL_VALIDATE_OCSP` | Enables OCSP validation when supported |
+| `FALKORDB_SSL_VALIDATE_OCSP_STAPLED` | Enables stapled OCSP validation when supported |
 | `FALKORDB_SSL_OCSP_EXPECTED_CERT` | Optional expected OCSP certificate |
 
-The installed FalkorDB client supports these connection and TLS options. Do
-not commit credentials or URLs containing credentials.
+The research helpers always select `incident_rehearsal_research` explicitly;
+changing `FALKORDB_GRAPH_NAME` does not merge the research graph into the
+synthetic graph.
 
-### 5. Start FalkorDB locally with Docker
+For hosted FalkorDB, use the provider's documented TLS/connection settings.
+Some free hosted plans may restrict TLS or certificate options; do not assume
+that setting `FALKORDB_SSL=true` can overcome a provider-side limitation.
+Never publish a connection URL containing credentials.
 
-A typical local FalkorDB container command is:
+#### Gemini settings
+
+`agent.py` checks these names, in order:
+
+```text
+GEMINI_API_KEY
+GOOGLE_API_KEY
+```
+
+The same names may be provided through Streamlit Community Cloud secrets.
+Gemini is needed for the LLM-generated synthetic incident report; the
+deterministic graph evidence and Murphy analysis do not require a Gemini call.
+
+### 4. Start FalkorDB locally
+
+If FalkorDB is not already running locally, a typical Docker command is:
 
 ```powershell
 docker run --name falkordb `
@@ -439,134 +372,233 @@ If the container already exists:
 docker start falkordb
 ```
 
-The Docker commands were not executed during this documentation update. Confirm the image tag and local Docker installation before use.
+These commands are setup examples; they were not executed as part of this
+README-only update.
 
-### 6. Configure Gemini locally
+## Running the application
 
-Create a `.env` file in the project root from the tracked template. Do not
-commit the local `.env`:
+### Seed the synthetic demonstration graph
 
-```powershell
-Copy-Item .env.example .env
-```
-
-`agent.py` loads `GEMINI_API_KEY` first and falls back to `GOOGLE_API_KEY`
-from the environment or `.env`. Never paste a real key into source code or
-public documentation.
-
-### 7. Seed the synthetic graph
+Run this only when you intentionally want to create or update the fictional
+service graph:
 
 ```powershell
 python .\seed_graph.py
 ```
 
-This writes the synthetic service and evidence records to FalkorDB using `MERGE`. It was not run as part of the README update.
+This script writes to the graph selected by `FALKORDB_GRAPH_NAME`, which should
+remain `incident_investigator` for the synthetic demo. **Do not use it for the
+Murphy research graph.**
 
-### 8. Run deterministic graph verification
-
-The relationship-effect verification temporarily removes only `Checkout → AuthService`, checks the changed tool output, restores the relationship with `MERGE`, and verifies the restored paths:
-
-```powershell
-python .\verify_graph_effect.py
-```
-
-This script changes the local graph temporarily and restores the edge in its cleanup path. Run it only against the intended local graph. It was not run as part of the README update.
-
-### 9. Start Streamlit
+### Start Streamlit
 
 ```powershell
-python -m streamlit run app.py
+python -m streamlit run .\app.py
 ```
 
-Open the local URL printed by Streamlit. Starting the Streamlit server and browser verification were not performed during the README update.
+The app presents four top-level sections:
 
-### Streamlit Community Cloud configuration
+1. **Overview** — describe an incident, focus a service, inspect health,
+   topology, and structural blast-radius metrics, then start the synthetic
+   investigation.
+2. **Incident Rehearsal** — select the baseline or an actual incoming
+   dependency edge, compare before/after reachability, and rank all candidate
+   scenarios. Edge removal is in memory only.
+3. **Murphy Research** — load recorded faults, select **Investigate fault**,
+   review exact overlap counts, topology, service/operation evidence,
+   provenance, parent-child paths, and evidence boundaries.
+4. **Investigation Report** — read or download the Markdown report generated by
+   the synthetic incident workflow.
 
-Deploy the repository with `app.py` as the main file. In the app's
-**Settings → Secrets** panel, add the following TOML configuration using your
-actual hosted FalkorDB values:
+### Beginner workflow: synthetic incident
 
-```toml
-GEMINI_API_KEY = "your-gemini-api-key-here"
-FALKORDB_URL = "falkors://username:password@example.com:6379"
-FALKORDB_GRAPH_NAME = "incident_investigator"
+1. Open **Overview** and keep the example incident or describe an observed
+   symptom.
+2. Confirm the **Focus service**. A service mentioned in the description may be
+   selected automatically.
+3. Read the dependency direction and blast-radius cards.
+4. Select **Investigate Incident** and review the graph-backed report.
+5. Open **Incident Rehearsal**, choose an incoming edge, and compare the
+   before/after structural reachability.
+6. Treat deployment, incident, owner, and runbook records as investigation
+   clues, not proof of cause or safe remediation.
+
+### Beginner workflow: Murphy recorded fault
+
+1. Open **Murphy Research**.
+2. Load the recorded fault list and select one fault.
+3. Click **Investigate fault**.
+4. Review the selected interval, exact overlapping trace/span counts, source
+   filenames, service/operation breakdown, and explicit parent-child paths.
+5. Use the topology legend to distinguish overlap highlighting, validated
+   target mappings, and unresolved targets.
+6. Separate measured observations from inferences. Temporal overlap alone does
+   not prove causality.
+
+## Murphy dataset setup and importer
+
+The official source is the [Murphy traces dataset at the University of Illinois
+Data Bank](https://databank.illinois.edu/datasets/IDB-6641912). Cite it as:
+
+```text
+University of Illinois Data Bank, Murphy traces dataset,
+DOI: 10.13012/B2IDB-6641912_V1, CC0.
 ```
 
-The application reads Streamlit secrets when available and keeps local
-environment/`.env` configuration working for development. For a URL without
-embedded credentials, provide `FALKORDB_USERNAME` and `FALKORDB_PASSWORD` as
-separate secrets. TLS and certificate settings use the `FALKORDB_SSL_*`
-variables documented above. Do not publish real secret values.
+The importer reads one local archive and selects a bounded set of relevant
+traces and spans. It does not download the dataset or load the full archive
+into memory.
 
-The remote FalkorDB endpoint must be reachable from Streamlit Community Cloud,
-allow its outbound connection, and contain the expected graph data. The app
-does not seed, update, delete, or otherwise modify the database at startup.
+### Supported command-line arguments
 
-## Using the application
+`import_murphy_traces.py` supports:
 
-1. Open the Overview tab.
-2. Describe the incident or use the default example.
-3. Choose the focus service. The app can automatically focus a service mentioned in the incident description.
-4. Review the live dependency graph and KPI cards.
-5. Select **Investigate Incident** to run the Gemini agent. If Gemini quota exhaustion is detected, the deterministic fallback creates a graph-evidence report.
-6. Open **Incident Rehearsal** to select the baseline or isolate an actual incoming edge.
-7. Use **Compare All Scenarios** to rank every candidate edge by lost graph reachability.
-8. Review Before/After Graphviz panels and the reachability comparison.
-9. Open **Investigation Report** to read or download the complete Markdown report.
+| Argument | Required/default | Meaning |
+|---|---|---|
+| `--archive PATH` | Required | Local `.tar.gz` archive to inspect |
+| `--graph-name NAME` | `incident_rehearsal_research` | Must be the isolated research graph |
+| `--max-traces N` | `5` | Maximum selected traces |
+| `--max-spans N` | `100` | Maximum selected spans |
+| `--write` | Off | Explicitly enable FalkorDB writes |
 
-## Verification and testing
-
-The following checks were confirmed in the existing virtual environment during project development:
+Use a local path appropriate to your machine. This example is not a universal
+path:
 
 ```powershell
-.\venv\Scripts\python.exe -m py_compile .\app.py .\agent.py .\tools.py
+python .\import_murphy_traces.py `
+  --archive D:\MurphyResearch\pilot\compute-faults\compute-12.tar.gz `
+  --max-traces 5 `
+  --max-spans 100
 ```
 
-The deterministic rehearsal checks covered:
+Dry-run mode is the default and prints parsed counts without writing. A write
+requires the explicit flag and is restricted to
+`incident_rehearsal_research`:
 
-- `AuthService` baseline: 3 unique dependents, 2 direct, 1 indirect, maximum distance 2.
-- Isolating `Checkout → AuthService`: 1 remaining unique dependent; `Checkout` and `MobileAPI` no longer reachable.
-- Isolating `CartService → AuthService`: 2 remaining unique dependents; only `CartService` no longer reachable.
-- Automatic scenario ranking, deterministic tie-breaking, and DOT edge removal.
+```powershell
+python .\import_murphy_traces.py `
+  --archive D:\MurphyResearch\pilot\compute-faults\compute-12.tar.gz `
+  --max-traces 5 `
+  --max-spans 100 `
+  --graph-name incident_rehearsal_research `
+  --write
+```
 
-The Python syntax checks and deterministic rehearsal checks above were run in
-the existing virtual environment. The Streamlit browser experience was not
-manually exercised during this documentation review, so no browser behavior is
-claimed as tested here. A fresh dependency installation, Docker startup, and a
-new Gemini API request were also not performed and are not claimed as tested.
+The importer rejects both `incident_investigator` and any other graph name.
+Do not run the write command unless you have reviewed the archive, target
+graph, credentials, and resulting records. The importer does not import
+Prometheus metrics in this pilot.
 
-## Evidence and safety boundaries
+To verify the separate research graph with read-only queries, use FalkorDB's
+browser/CLI or a small `ro_query` script. For example:
 
-- The seeded records are synthetic demonstration data.
-- A graph dependency path indicates potential structural exposure, not a confirmed outage.
-- A recent deployment and historical incident are clues, not proof of current causality.
-- Missing graph records are unknown information, not evidence that an event did not occur.
+```cypher
+MATCH (n:FaultInjection)
+RETURN count(n) AS faults;
+
+MATCH (n:ResearchSpan)
+RETURN count(n) AS spans;
+
+MATCH ()-[r:PARENT_OF]->()
+RETURN count(r) AS parent_child_relationships;
+```
+
+Do not run the existing `seed_graph.py` against the research graph.
+
+## Testing
+
+Run the focused Murphy suite from the repository root:
+
+```powershell
+.\venv\Scripts\python.exe -m unittest .\test_murphy_importer.py
+```
+
+Compile the application, tools, importer, and tests:
+
+```powershell
+.\venv\Scripts\python.exe -m py_compile `
+  .\app.py `
+  .\tools.py `
+  .\import_murphy_traces.py `
+  .\test_murphy_importer.py
+```
+
+Check whitespace errors:
+
+```powershell
+git diff --check
+```
+
+The current focused suite contains 10 tests and passed in the existing
+environment during the product review. The suite also intentionally exercises
+the importer safety error for `incident_investigator`; its argparse usage text
+is expected output from that negative test. Browser interaction, a fresh
+dependency installation, Docker startup, and a new Gemini request were not
+performed during this README-only update.
+
+## Security, limitations, and interpretation
+
+- The two FalkorDB graphs are separate and must remain separate.
+- Synthetic services, statuses, deployments, incidents, owners, and runbooks
+  are fictional demonstration records.
+- Murphy records are experimental benchmark observations, not a live
+  production incident.
+- A dependency path indicates structural exposure, not a confirmed outage,
+  synchronous behavior, business criticality, or causality.
+- Temporal overlap between a fault interval and a span does not prove that the
+  fault caused the span behavior.
+- Container identifiers and research components must not be guessed into
+  production service identities. The UI keeps unresolved targets explicit.
+- The bounded sample may omit traces, spans, and parent spans outside the
+  imported selection.
+- Prometheus metrics and `wrkOutput` were not imported. The present pilot does
+  not diagnose CPU or memory anomalies from those sources.
+- The demo does not establish production ownership, deployment history,
+  runbook coverage, root cause, or safe remediation.
 - Blast-radius counts do not represent business criticality.
-- The Automatic Scenario Analyzer ranks graph reachability changes; it does not recommend a production change.
-- Incident Rehearsal operates on an in-memory edge copy and does not validate whether isolation preserves production functionality.
-- The application does not expose API keys in its user-facing error messages.
+- Scenario comparison ranks structural reachability changes; it is not a
+  production-change recommendation or safety guarantee.
+- Keep `.env` private. Never commit Gemini keys, FalkorDB passwords, or URLs
+  containing credentials.
+- If a FalkorDB Free plan limits TLS or certificate options, follow the hosted
+  provider's supported connection configuration rather than weakening
+  certificate validation.
+
+## Two-minute demo walkthrough
+
+1. Open **Overview** and explain that the five-service graph is synthetic
+   demonstration data.
+2. Focus `AuthService` and point out the three incoming impact paths:
+   `Checkout -> AuthService`, `CartService -> AuthService`, and
+   `MobileAPI -> Checkout -> AuthService`.
+3. Open **Incident Rehearsal**, isolate `Checkout -> AuthService`, and show
+   the before/after reachability comparison. Emphasize that the database was
+   not changed.
+4. Open **Murphy Research**, select a recorded fault, and investigate it.
+   Show the exact overlapping spans, source provenance, and explicit
+   parent-child topology.
+5. Close by explaining what the graph proves and what it does not: graph
+   relationships and temporal overlap are evidence for investigation, not
+   causal proof or a production remediation.
 
 ## Project structure
 
 | File | Purpose |
 |---|---|
-| `app.py` | Streamlit UI, Graphviz rendering, blast-radius helpers, Incident Rehearsal, and scenario analyzer |
-| `agent.py` | Gemini LangChain agent, evidence-grounded prompt, quota detection, and deterministic fallback report |
-| `tools.py` | Shared FalkorDB connection, read-only Cypher queries, LangChain tools, and `incident_tools` |
-| `seed_graph.py` | Idempotent synthetic service and operational-evidence seed script |
-| `verify_graph_effect.py` | Temporary relationship deletion/restoration verification |
-| `requirements.txt` | Python dependency constraints |
-| `.env.example` | Safe template containing the required environment variable name |
-| `.env` | Local secret configuration; ignored by Git and not committed |
-
-## Limitations and future work
-
-- The current graph schema is a demonstration model and is not connected to production telemetry.
-- Incident descriptions are supplied by users and are not independently verified.
-- The deterministic fallback preserves evidence but does not provide LLM-generated prioritization.
-- The rehearsal simulator models dependency reachability only; it does not model retries, queues, traffic, health checks, or runtime service behavior.
-- A production deployment would need stronger secret management, authentication, observability, and a controlled graph-data ingestion process.
+| [`app.py`](./app.py) | Streamlit UI, Graphviz views, rehearsal workflow, Murphy UI |
+| [`tools.py`](./tools.py) | FalkorDB connection, read-only Cypher, LangChain tools, research analysis |
+| [`agent.py`](./agent.py) | Gemini LangChain agent and deterministic quota fallback |
+| [`seed_graph.py`](./seed_graph.py) | Synthetic demonstration graph writer |
+| [`verify_graph_effect.py`](./verify_graph_effect.py) | Temporary synthetic-edge verification |
+| [`import_murphy_traces.py`](./import_murphy_traces.py) | Bounded, dry-run-first research importer |
+| [`test_murphy_importer.py`](./test_murphy_importer.py) | Murphy parser, overlap, topology, and safety tests |
+| [`requirements.txt`](./requirements.txt) | Pinned Python dependencies |
+| [`.env.example`](./.env.example) | Safe configuration template |
+| [`.gitignore`](./.gitignore) | Ignores credentials, environments, archives, and raw research data |
 
 ## License
 
-No license file is currently present in the project. Add an explicit open-source license before distributing the repository publicly.
+No repository license file is currently present. Add an explicit open-source
+license before distributing the repository publicly. The CC0 statement above
+applies to the Murphy dataset record, not automatically to this repository's
+source code.

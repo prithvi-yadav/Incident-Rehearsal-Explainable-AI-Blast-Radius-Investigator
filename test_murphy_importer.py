@@ -16,6 +16,7 @@ from import_murphy_traces import (
     inspect_archive,
 )
 from tools import analyze_murphy_fault
+from app import _build_murphy_topology_graph, _derive_murphy_topology
 
 
 class MurphyImporterTests(unittest.TestCase):
@@ -103,6 +104,50 @@ class MurphyImporterTests(unittest.TestCase):
         self.assertEqual(analysis["breakdown"][0]["Overlapping spans"], 1)
         self.assertEqual(len(analysis["parent_child_paths"]), 1)
         self.assertEqual(len(analysis["sample_only_spans"]), 1)
+
+    def test_murphy_topology_uses_explicit_mapped_parent_edges(self) -> None:
+        topology = _derive_murphy_topology(
+            [
+                {
+                    "mapped_service": "frontend",
+                    "parent_mapped_service": "search",
+                    "resolved_parent_span_id": "parent-1",
+                    "original_span_id": "span-1",
+                    "overlaps_selected_fault": True,
+                },
+                {
+                    "mapped_service": "frontend",
+                    "parent_mapped_service": "frontend",
+                    "resolved_parent_span_id": "parent-2",
+                    "original_span_id": "span-2",
+                    "overlaps_selected_fault": False,
+                },
+            ],
+            "frontend-pod",
+        )
+        self.assertEqual(topology["edges"], [("search", "frontend")])
+        self.assertEqual(topology["overlapping_services"], ["frontend"])
+        self.assertIn("search", _build_murphy_topology_graph(topology))
+        self.assertIn("frontend", _build_murphy_topology_graph(topology))
+
+    def test_murphy_topology_keeps_unknown_target_unresolved(self) -> None:
+        topology = _derive_murphy_topology(
+            [
+                {
+                    "mapped_service": "",
+                    "parent_mapped_service": "search",
+                    "resolved_parent_span_id": "parent-1",
+                    "original_span_id": "span-1",
+                }
+            ],
+            "search-abc123",
+        )
+        self.assertFalse(topology["target_is_resolved"])
+        self.assertEqual(topology["target_label"], "Target component\nsearch-abc123")
+        self.assertEqual(topology["edges"], [])
+        graph = _build_murphy_topology_graph(topology)
+        self.assertIn("Target component", graph)
+        self.assertIn("search-abc123", graph)
 
     def test_bounded_archive_selection_and_duplicate_ids(self) -> None:
         trace = {

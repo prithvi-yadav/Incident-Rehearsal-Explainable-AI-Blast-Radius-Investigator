@@ -13,6 +13,7 @@ from tools import (
     analyze_murphy_fault,
     get_murphy_fault_investigation,
     get_murphy_faults,
+    get_murphy_research_counts,
     get_service_graph_data,
 )
 
@@ -98,6 +99,101 @@ def _build_dependency_graph(
             f'  "{_dot_escape(dependent)}" -> "{_dot_escape(dependency)}";'
         )
 
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _derive_murphy_topology(
+    spans: list[dict[str, Any]],
+    target_entity: str,
+    target_mapped_service: str | None = None,
+) -> dict[str, Any]:
+    """Derive only explicit service edges from stored parent-child evidence."""
+    services: set[str] = set()
+    overlapping_services: set[str] = set()
+    edges: set[tuple[str, str]] = set()
+    edge_evidence: dict[tuple[str, str], set[str]] = {}
+
+    for span in spans:
+        child_service = (
+            span.get("mapped_service") or span.get("service_name") or ""
+        ).strip()
+        if child_service:
+            services.add(child_service)
+            if span.get("overlaps_selected_fault") is True:
+                overlapping_services.add(child_service)
+
+        parent_service = (span.get("parent_mapped_service") or "").strip()
+        if (
+            parent_service
+            and child_service
+            and parent_service != child_service
+            and span.get("resolved_parent_span_id")
+        ):
+            edge = (parent_service, child_service)
+            edges.add(edge)
+            edge_evidence.setdefault(edge, set()).add(
+                str(span.get("original_span_id") or span.get("span_id") or "unknown")
+            )
+
+    target_label = (target_mapped_service or target_entity or "").strip()
+    target_is_resolved = bool(target_mapped_service and target_mapped_service.strip())
+    if target_label:
+        if target_is_resolved:
+            services.add(target_label)
+        else:
+            target_label = f"Target component\n{target_label}"
+
+    return {
+        "services": sorted(services),
+        "overlapping_services": sorted(overlapping_services),
+        "edges": sorted(edges),
+        "edge_evidence": {
+            edge: sorted(span_ids)
+            for edge, span_ids in sorted(edge_evidence.items())
+        },
+        "target_label": target_label,
+        "target_is_resolved": target_is_resolved,
+    }
+
+
+def _build_murphy_topology_graph(
+    topology: dict[str, Any],
+) -> str:
+    """Build a Graphviz view from recorded Murphy topology evidence."""
+    lines = [
+        "digraph murphy_trace_topology {",
+        '  graph [rankdir=LR, bgcolor="transparent", pad="0.35", '
+        'nodesep="0.65", ranksep="1.0", margin="0.15"];',
+        '  node [shape=box, style="rounded,filled", fontname="Arial", '
+        'fontsize="11", fontcolor="#f8fafc", margin="0.18,0.12"];',
+        '  edge [color="#94a3b8", penwidth="1.5", arrowsize="0.75", '
+        'fontname="Arial", fontsize="9"];',
+    ]
+    target_label = topology.get("target_label", "")
+    overlapping = set(topology.get("overlapping_services", []))
+    for service in topology.get("services", []):
+        if service == target_label and topology.get("target_is_resolved"):
+            color, border, penwidth = "#7c3aed", "#c4b5fd", "3.0"
+        elif service in overlapping:
+            color, border, penwidth = "#b45309", "#fbbf24", "2.8"
+        else:
+            color, border, penwidth = "#334155", "#64748b", "1.5"
+        lines.append(
+            f'  "{_dot_escape(service)}" [label="{_dot_escape(service)}", '
+            f'fillcolor="{color}", color="{border}", penwidth="{penwidth}"];'
+        )
+
+    if target_label and not topology.get("target_is_resolved"):
+        lines.append(
+            f'  "{_dot_escape(target_label)}" [label="{_dot_escape(target_label)}", '
+            'shape=note, fillcolor="#475569", color="#f59e0b", penwidth="2.5"];'
+        )
+
+    for parent, child in topology.get("edges", []):
+        lines.append(
+            f'  "{_dot_escape(parent)}" -> "{_dot_escape(child)}";'
+        )
     lines.append("}")
     return "\n".join(lines)
 
@@ -237,31 +333,75 @@ def main() -> None:
         <style>
         .block-container {
             max-width: 1440px;
-            padding-top: 1.75rem;
-            padding-bottom: 2rem;
+            padding-top: 1.25rem;
+            padding-bottom: 1.5rem;
         }
         .app-subtitle {
             color: #5f6b7a;
-            font-size: 1rem;
-            line-height: 1.6;
-            margin-bottom: 1rem;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            margin: 0.15rem 0 1.1rem;
+            max-width: 920px;
+        }
+        .eyebrow {
+            color: #64748b;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            margin-bottom: 0.35rem;
+        }
+        .section-kicker {
+            color: #64748b;
+            font-size: 0.82rem;
+            margin-top: -0.35rem;
+            margin-bottom: 0.8rem;
+        }
+        div[data-testid="stMetric"] {
+            min-height: 5.25rem;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 1.45rem;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
+    st.markdown('<div class="eyebrow">Incident response workspace</div>', unsafe_allow_html=True)
     st.title("AI Incident Investigator")
     st.markdown(
         (
             '<p class="app-subtitle">'
-            "Investigate software incidents by tracing service dependencies and "
-            "retrieving deployment history, past incidents, service owners, "
-            "and runbooks from FalkorDB."
+            "Two complementary workflows for explainable incident response: "
+            "rehearse dependency blast radius on synthetic operational data, "
+            "or inspect injected-fault evidence from a research benchmark. "
+            "Murphy data is not live production telemetry."
             "</p>"
         ),
         unsafe_allow_html=True,
     )
+    with st.container(border=True):
+        st.markdown("**How to investigate**")
+        guide_columns = st.columns(2)
+        with guide_columns[0]:
+            st.markdown(
+                "**Incident Rehearsal**  \n"
+                "1. Select or focus a service.  \n"
+                "2. Inspect health and dependency topology.  \n"
+                "3. Review the calculated blast radius.  \n"
+                "4. Choose a hypothetical dependency-removal scenario.  \n"
+                "5. Compare reachability before and after, then read the explanation."
+            )
+        with guide_columns[1]:
+            st.markdown(
+                "**Murphy Fault Investigator**  \n"
+                "1. Load recorded research faults.  \n"
+                "2. Select a fault and run the investigation.  \n"
+                "3. Review overlapping traces, spans, and parent-child paths.  \n"
+                "4. Check source provenance and the bounded-sample boundary.  \n"
+                "5. Separate measured observations from inferences."
+            )
 
     try:
         services, dependencies = get_service_graph_data()
@@ -272,11 +412,22 @@ def main() -> None:
         services, dependencies = [], []
 
     service_names = [service["name"] for service in services if service["name"]]
-    overview_tab, rehearsal_tab, report_tab = st.tabs(
-        ["Overview", "Incident Rehearsal", "Investigation Report"]
+    overview_tab, rehearsal_tab, murphy_tab, report_tab = st.tabs(
+        [
+            "Overview",
+            "Incident Rehearsal",
+            "Murphy Research",
+            "Investigation Report",
+        ]
     )
 
     with overview_tab:
+        st.subheader("Define the incident")
+        st.markdown(
+            '<div class="section-kicker">Start with the observed symptom, then '
+            "confirm the service focus against the live FalkorDB topology.</div>",
+            unsafe_allow_html=True,
+        )
         incident_description = st.text_area(
             "Describe the incident",
             value=DEFAULT_INCIDENT,
@@ -332,6 +483,28 @@ def main() -> None:
             "indirect_count": 0,
             "maximum_distance": 0,
         }
+        if focus_service:
+            st.subheader("Current service health and topology")
+            st.caption(
+                "A → B means service A depends on service B. "
+                "Structural dependencies do not prove a real-time outage or "
+                "root cause. This is a rendered Graphviz view, not a clickable "
+                "node canvas; use the Focus service selector to update the "
+                "highlight, metrics, and evidence."
+            )
+            with st.container(border=True):
+                st.graphviz_chart(
+                    _build_dependency_graph(services, dependencies, focus_service),
+                    width="stretch",
+                    height=430,
+                )
+            st.caption(
+                "Legend: "
+                ":green[healthy] · :orange[degraded] · :red[failing] · "
+                ":gray[unknown]. Blue border indicates the focused service."
+            )
+
+        st.subheader("Blast-radius snapshot")
         kpi_columns = st.columns(4)
         kpi_values = (
             ("Services", len(services)),
@@ -340,25 +513,8 @@ def main() -> None:
             ("Unique dependents", blast_radius["unique_count"]),
         )
         for column, (label, value) in zip(kpi_columns, kpi_values):
-            column.metric(label, value, border=True)
-
-        if focus_service:
-            st.subheader("Service dependency graph")
-            st.caption(
-                "A → B means service A depends on service B. "
-                "Structural dependencies do not prove a real-time outage or "
-                "root cause."
-            )
-            st.graphviz_chart(
-                _build_dependency_graph(services, dependencies, focus_service),
-                width="stretch",
-                height=610,
-            )
-            st.caption(
-                "Legend: "
-                ":green[healthy] · :orange[degraded] · :red[failing] · "
-                ":gray[unknown]. Blue border indicates the focused service."
-            )
+            with column:
+                st.metric(label, value, border=True)
 
         if st.button(
             "Investigate Incident",
@@ -403,6 +559,12 @@ def main() -> None:
             "confirm a real-world outage."
         )
         if focus_service:
+            st.markdown(
+                '<div class="section-kicker">Choose one incoming edge or compare '
+                "all actual edges. Every result is calculated in memory from the "
+                "current graph.</div>",
+                unsafe_allow_html=True,
+            )
             incoming_edges = sorted(
                 {
                     (dependent.strip(), dependency.strip())
@@ -456,13 +618,13 @@ def main() -> None:
                     )
 
             rehearsal = st.session_state.get("rehearsal_result")
-            st.markdown("**Automatic Scenario Analyzer**")
+            st.subheader("Automatic scenario analyzer")
             st.caption(
                 "Compare every actual incoming edge as a graph-only hypothetical "
                 "scenario. This ranking is not a production recommendation or "
                 "proof that an action is safe."
             )
-            if st.button("Compare All Scenarios", width="stretch"):
+            if st.button("Compare all scenarios", width="stretch"):
                 all_results = [
                     _build_isolation_result(
                         focus_service,
@@ -514,7 +676,8 @@ def main() -> None:
                     }
                     for index, result in enumerate(results, start=1)
                 ]
-                st.table(rows)
+                with st.container(border=True):
+                    st.table(rows)
                 automatic_options = [
                     result["scenario"] for result in results
                 ]
@@ -582,26 +745,32 @@ def main() -> None:
                 for column, heading, values, graph_edges in graph_columns:
                     with column:
                         st.markdown(f"**{heading}**")
-                        st.graphviz_chart(
-                            _build_dependency_graph(
-                                services,
-                                graph_edges,
-                                focus_service,
-                                reachable_services=set(values["dependents"]),
-                                no_longer_reachable=set(
-                                    comparison["no_longer_reachable"]
+                        with st.container(border=True):
+                            st.graphviz_chart(
+                                _build_dependency_graph(
+                                    services,
+                                    graph_edges,
+                                    focus_service,
+                                    reachable_services=set(values["dependents"]),
+                                    no_longer_reachable=set(
+                                        comparison["no_longer_reachable"]
+                                    ),
                                 ),
-                            ),
-                            width="stretch",
-                            height=360,
-                        )
-                        for label, key in (
-                            ("Unique dependents", "unique_count"),
-                            ("Direct dependents", "direct_count"),
-                            ("Indirect dependents", "indirect_count"),
-                            ("Maximum shortest distance", "maximum_distance"),
-                        ):
-                            st.metric(label, values[key], border=True)
+                                width="stretch",
+                                height=300,
+                            )
+                            metric_columns = st.columns(4)
+                            for metric_column, (label, key) in zip(
+                                metric_columns,
+                                (
+                                    ("Unique dependents", "unique_count"),
+                                    ("Direct dependents", "direct_count"),
+                                    ("Indirect dependents", "indirect_count"),
+                                    ("Maximum distance", "maximum_distance"),
+                                ),
+                            ):
+                                with metric_column:
+                                    st.metric(label, values[key], border=True)
 
                 st.caption(
                     "Legend: "
@@ -666,8 +835,8 @@ def main() -> None:
                 "Run an investigation from the Overview tab to generate a report."
             )
 
-    with st.expander("Murphy Fault Investigator", expanded=False):
-        st.subheader("Murphy Fault Investigator")
+    with murphy_tab:
+        st.title("Murphy Research")
         st.caption(
             "Explore bounded research evidence from the isolated "
             "`incident_rehearsal_research` graph. These are experimental "
@@ -677,6 +846,9 @@ def main() -> None:
         if st.button("Load recorded Murphy faults", width="stretch"):
             try:
                 st.session_state["murphy_faults"] = get_murphy_faults()
+                st.session_state["murphy_research_counts"] = (
+                    get_murphy_research_counts()
+                )
                 st.session_state.pop("murphy_fault_result", None)
             except Exception:
                 logger.exception("Unable to load Murphy research faults")
@@ -686,7 +858,27 @@ def main() -> None:
                 )
 
         murphy_faults = st.session_state.get("murphy_faults", [])
+        research_counts = st.session_state.get("murphy_research_counts", {})
+        if research_counts:
+            count_columns = st.columns(5)
+            for column, (label, key) in zip(
+                count_columns,
+                (
+                    ("Datasets", "datasets"),
+                    ("Runs", "runs"),
+                    ("Faults", "faults"),
+                    ("Traces", "traces"),
+                    ("Spans", "spans"),
+                ),
+            ):
+                column.metric(label, research_counts.get(key, 0), border=True)
         if murphy_faults:
+            st.markdown(
+                '<div class="section-kicker">Select an experimentally injected '
+                "fault to inspect only the bounded evidence stored in the "
+                "isolated research graph.</div>",
+                unsafe_allow_html=True,
+            )
             fault_options = {
                 (
                     f"{fault['phase']} · {fault['target_entity']} · "
@@ -735,19 +927,23 @@ def main() -> None:
                 summary_columns[0].metric(
                     "Overlapping traces",
                     len(analysis["overlapping_traces"]),
+                    border=True,
                 )
                 summary_columns[1].metric(
                     "Overlapping spans",
                     len(analysis["overlapping_spans"]),
+                    border=True,
                 )
                 summary_columns[2].metric(
                     "Bounded sample spans",
                     len(result.get("spans", [])),
+                    border=True,
                 )
                 st.info(analysis["conclusion"])
                 if analysis["breakdown"]:
                     st.markdown("**Service and operation breakdown**")
-                    st.table(analysis["breakdown"])
+                    with st.container(border=True):
+                        st.table(analysis["breakdown"])
                 if analysis["overlapping_spans"]:
                     st.markdown(
                         "**Supporting trace evidence**  \n"
@@ -756,17 +952,18 @@ def main() -> None:
                     )
                 if analysis["parent_child_paths"]:
                     st.markdown("**Explicit parent-child trace paths**")
-                    st.table(
-                        [
-                            {
-                                "Trace": path["trace_id"],
-                                "Parent span": path["parent_span_id"],
-                                "Overlapping span": path["span_id"],
-                                "Source": path["source_file"],
-                            }
-                            for path in analysis["parent_child_paths"]
-                        ]
-                    )
+                    with st.container(border=True):
+                        st.table(
+                            [
+                                {
+                                    "Trace": path["trace_id"],
+                                    "Parent span": path["parent_span_id"],
+                                    "Overlapping span": path["span_id"],
+                                    "Source": path["source_file"],
+                                }
+                                for path in analysis["parent_child_paths"]
+                            ]
+                        )
                 if analysis["unresolved_parent_evidence"]:
                     st.caption(
                         f"{len(analysis['unresolved_parent_evidence'])} "
@@ -793,6 +990,49 @@ def main() -> None:
                     "runbooks. Temporal overlap alone does not prove that the "
                     "injected fault caused any span behavior."
                 )
+                topology = _derive_murphy_topology(
+                    result.get("spans", []),
+                    fault.get("target_entity", ""),
+                    fault.get("target_mapped_service"),
+                )
+                st.markdown("**Recorded trace topology**")
+                st.caption(
+                    "Nodes and arrows below use only Jaeger service mappings and "
+                    "explicit stored parent-child span relationships. Amber "
+                    "nodes indicate services with spans overlapping the selected "
+                    "fault; the outlined target component is unresolved unless "
+                    "the graph contains a validated mapping."
+                )
+                if (
+                    topology["edges"]
+                    or topology["services"]
+                    or topology["target_label"]
+                ):
+                    with st.container(border=True):
+                        st.graphviz_chart(
+                            _build_murphy_topology_graph(topology),
+                            width="stretch",
+                            height=300,
+                        )
+                    st.caption(
+                        "Legend: amber border = exact-fault overlap; purple "
+                        "border = validated fault-target service; note-shaped "
+                        "node = unresolved raw target. Arrows are explicit "
+                        "parent service → child service evidence, not causal "
+                        "claims."
+                    )
+                    if not topology["edges"]:
+                        st.info(
+                            "The bounded sample provides nodes but no explicit "
+                            "cross-service edge with both endpoints mapped. "
+                            "The isolated nodes are shown without inventing "
+                            "relationships."
+                        )
+                else:
+                    st.info(
+                        "No mapped services or explicit parent-child topology "
+                        "was available in the bounded research sample."
+                    )
                 spans = result.get("spans", [])
                 if not spans:
                     st.warning(
@@ -800,31 +1040,31 @@ def main() -> None:
                         "research sample for this fault."
                     )
                 else:
-                    st.markdown("**Measured trace evidence**")
-                    st.table(
-                        [
-                            {
-                                "Trace": span["trace_id"],
-                                "Span": span["original_span_id"],
-                                "Parent span": (
-                                    span["resolved_parent_span_id"]
-                                    or span["parent_span_id"]
-                                    or "Not resolved"
-                                ),
-                                "Service mapping": (
-                                    span["mapped_service"]
-                                    or span["service_name"]
-                                    or "Unknown"
-                                ),
-                                "Operation": span["operation_name"] or "Unknown",
-                                "Overlaps selected fault": span.get(
-                                    "overlaps_selected_fault", "unknown"
-                                ),
-                                "Source": span["source_file"],
-                            }
-                            for span in spans
-                        ]
-                    )
+                    with st.expander("Detailed measured trace evidence", expanded=False):
+                        st.table(
+                            [
+                                {
+                                    "Trace": span["trace_id"],
+                                    "Span": span["original_span_id"],
+                                    "Parent span": (
+                                        span["resolved_parent_span_id"]
+                                        or span["parent_span_id"]
+                                        or "Not resolved"
+                                    ),
+                                    "Service mapping": (
+                                        span["mapped_service"]
+                                        or span["service_name"]
+                                        or "Unknown"
+                                    ),
+                                    "Operation": span["operation_name"] or "Unknown",
+                                    "Overlaps selected fault": span.get(
+                                        "overlaps_selected_fault", "unknown"
+                                    ),
+                                    "Source": span["source_file"],
+                                }
+                                for span in spans
+                            ]
+                        )
                     st.info(
                         "Temporal overlap is a measured relationship between "
                         "recorded intervals. It does not prove that the injected "
