@@ -190,6 +190,30 @@ call.
 | `AFFECTED` | `PastIncident -> Service` |
 | `DOCUMENTED_IN` | `Service -> Runbook` |
 
+### Synthetic graph: the demo service topology
+
+This is the actual seeded `incident_investigator` graph model. The arrows
+retain the direction written by `seed_graph.py`: a service points to the
+service it depends on.
+
+```mermaid
+flowchart LR
+    MobileAPI["Service: MobileAPI"] -->|DEPENDS_ON| Checkout["Service: Checkout"]
+    Checkout -->|DEPENDS_ON| AuthService["Service: AuthService"]
+    CartService["Service: CartService"] -->|DEPENDS_ON| AuthService
+    AuthService -->|DEPENDS_ON| UserDB["Service: UserDB"]
+
+    AuthService -->|MAINTAINED_BY| Alice["Developer: Alice"]
+    Deployment["Deployment: deploy-v2.4"] -->|DEPLOYED_TO| AuthService
+    Incident["PastIncident: INC-88"] -->|AFFECTED| AuthService
+    AuthService -->|DOCUMENTED_IN| Runbook["Runbook: RB-AUTH-01"]
+```
+
+The service nodes and relationship types above are the graph used by the
+synthetic Overview and Incident Rehearsal workflows. The Graphviz view in the
+application is a rendered view of graph records; it is not a clickable
+FalkorDB browser.
+
 ### Research graph schema
 
 The importer creates isolated research labels and relationships:
@@ -212,7 +236,37 @@ The importer creates isolated research labels and relationships:
 | `HAS_TRACE` | Run -> trace |
 | `HAS_SPAN` | Trace -> span |
 | `PARENT_OF` | Parent span -> child span |
-| `MAPPED_TO_SERVICE` | Span or component -> recorded research service |
+| `MAPPED_TO_SERVICE` | Span -> recorded research service |
+
+### Murphy research graph: the evidence model
+
+This is the isolated `incident_rehearsal_research` model written by
+`import_murphy_traces.py`. It deliberately does not connect to the synthetic
+`Service` graph.
+
+```mermaid
+flowchart LR
+    Dataset["ResearchDataset<br/>Murphy traces"] -->|HAS_RUN| Run["ResearchRun<br/>compute-12"]
+    Run -->|HAS_FAULT| Fault["FaultInjection<br/>recorded fault"]
+    Fault -->|TARGETS| Component["ResearchComponent<br/>raw target"]
+    Run -->|HAS_TRACE| Trace["ResearchTrace<br/>bounded trace"]
+    Trace -->|HAS_SPAN| Span["ResearchSpan<br/>Jaeger span"]
+    Parent["ResearchSpan<br/>parent span"] -->|PARENT_OF| Span
+    Span -->|MAPPED_TO_SERVICE| Service["ResearchService<br/>Jaeger serviceName"]
+```
+
+`ResearchComponent` preserves the raw fault target identity. The importer
+does not create a `ResearchComponent -> ResearchService` mapping, so a target
+is not silently converted into a service name. The displayed parent and child
+span nodes are both `ResearchSpan` nodes; the diagram shows their exact stored
+relationship.
+
+The research topology rendered by the application is narrower than the full
+schema diagram: it draws a service-to-service arrow only when an explicit
+`PARENT_OF` span relationship exists and both spans have recorded
+`MAPPED_TO_SERVICE` relationships. It suppresses self-loops and duplicate
+edges. Missing mappings remain unresolved rather than becoming invented
+relationships.
 
 ### Representative Cypher
 
@@ -266,7 +320,29 @@ RETURN trace.id, span.id, span.parent_span_id,
        span.source_file
 ```
 
-FalkorDB is central because the investigation follows relationships:
+FalkorDB is central because the investigation follows relationships rather
+than merely displaying static rows:
+
+- For the synthetic blast radius, the query follows incoming
+  `DEPENDS_ON` paths from dependent services to the selected target:
+
+  ```cypher
+  MATCH p = (dependent:Service)-[:DEPENDS_ON*1..5]->(target:Service)
+  WHERE target.name = $service_name
+  RETURN p, length(p) AS hops
+  ```
+
+  The application then counts unique dependent services and their shortest
+  path distances. A path indicates potential structural exposure, not a
+  confirmed outage or causal chain.
+- For Murphy investigation, the query starts at a selected
+  `FaultInjection`, follows `HAS_TRACE` and `HAS_SPAN`, and optionally follows
+  `PARENT_OF` and `MAPPED_TO_SERVICE` to retrieve linked trace/span evidence.
+  Python compares the exact selected fault interval with preserved Jaeger
+  microsecond intervals. Temporal overlap is a measured time relationship, not
+  proof that the fault caused the span behavior.
+
+The complete relationship set used by the investigation includes:
 dependent-service paths, deployment-to-service evidence, fault-to-component
 links, trace/span membership, service mappings, and parent-child spans. A
 flat table could display the same fields, but it would not provide the
